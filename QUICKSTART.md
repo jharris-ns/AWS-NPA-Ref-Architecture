@@ -1,6 +1,6 @@
-# Quick Start Guide - NPA Publisher Single Instance
+# Quick Start Guide - NPA Publisher Deployment
 
-Get your Netskope Private Access Publisher deployed in under 10 minutes.
+Get your Netskope Private Access Publisher deployed with multi-AZ redundancy in under 10 minutes.
 
 ## Prerequisites Checklist
 
@@ -223,16 +223,17 @@ aws cloudformation describe-stacks \
 
 ## Deployment Timeline
 
-Typical deployment time: **4-8 minutes**
+Typical deployment time: **4-10 minutes** (varies with single-AZ vs multi-AZ)
 
+### Single-AZ Deployment
 ```
 t=0m    CloudFormation: CREATE_IN_PROGRESS
-        ├─ VPC resources created (if new VPC)
+        ├─ VPC resources created (if new VPC, 1 AZ)
         ├─ Security group created
         ├─ IAM role created
         └─ Secrets Manager secret created
 
-t=1m    EC2 instance launched
+t=1m    EC2 instance launched (AZ1)
         └─ SSM Agent starts
 
 t=2m    Lambda triggered
@@ -255,6 +256,31 @@ t=7m    Lambda updates private apps
         └─ Assigns publisher to matching apps
 
 t=8m    CloudFormation: CREATE_COMPLETE ✅
+```
+
+### Multi-AZ Deployment (Recommended)
+```
+t=0m    CloudFormation: CREATE_IN_PROGRESS
+        ├─ VPC resources created (if new VPC, 2 AZs)
+        ├─ NAT Gateways x2 created
+        ├─ Security group created
+        ├─ IAM role created
+        └─ Secrets Manager secret created
+
+t=1m    EC2 instances launched (AZ1 + AZ2)
+        └─ SSM Agents start
+
+t=2m    Lambda triggered for both instances
+        ├─ Creates publishers in Netskope
+        └─ Gets registration tokens
+
+t=3-4m  Lambda processes both instances in parallel
+        └─ Both instances register simultaneously
+
+t=5-8m  Publishers registered in both AZs
+        └─ Multi-AZ redundancy active
+
+t=10m   CloudFormation: CREATE_COMPLETE ✅
 ```
 
 ## Verify Deployment

@@ -1,20 +1,20 @@
-# NPA Publisher - Single Instance Deployment
+# NPA Publisher - Multi-AZ Deployment
 
-Automated deployment of Netskope Private Access (NPA) Publisher using CloudFormation with a single EC2 instance and CloudFormation Custom Resources for publisher registration.
+Automated deployment of Netskope Private Access (NPA) Publishers using CloudFormation with multi-AZ redundancy and CloudFormation Custom Resources for publisher registration.
 
 ## Overview
 
-This solution provides a streamlined deployment of an NPA Publisher with automatic registration to your Netskope tenant. It uses CloudFormation Custom Resources and AWS Systems Manager to handle the publisher setup without requiring manual intervention or exposing secrets.
+This solution provides a highly available deployment of NPA Publishers with automatic registration to your Netskope tenant. It supports multi-AZ deployment for production redundancy and uses CloudFormation Custom Resources and AWS Systems Manager to handle the publisher setup without requiring manual intervention or exposing secrets.
 
 ## VPC Deployment Options
 
 The template supports two deployment modes:
 
-### Option 1: Create New VPC (Recommended for Testing)
+### Option 1: Create New VPC (Recommended for Testing & Production)
 
-- **Automatically creates**: VPC, Internet Gateway, NAT Gateway, Public & Private Subnets
-- **Routing**: Configured automatically for internet access
-
+- **Automatically creates**: VPC, Internet Gateway, NAT Gateways (2), Public & Private Subnets (2 AZs)
+- **Routing**: Configured automatically for redundant internet access
+- **High Availability**: Multi-AZ deployment with redundant NAT Gateways
 
 **Parameters**:
 ```yaml
@@ -23,24 +23,29 @@ VPCCIDR: 10.0.0.0/16
 PublicSubnetCIDR: 10.0.1.0/24
 PrivateSubnetCIDR: 10.0.2.0/24
 AvailabilityZone: (optional, auto-selected if not specified)
+PublicSubnetCIDR2: 10.0.3.0/24
+PrivateSubnetCIDR2: 10.0.4.0/24
+AvailabilityZone2: (optional, auto-selected if not specified)
 ```
 
 ### Option 2: Use Existing VPC (Recommended for Production)
 Best for production deployments in your existing infrastructure:
-- **Requires**: Existing VPC with private subnets that hava NAT Gateways and relevant route tables
-
+- **Requires**: Existing VPC with private subnets (2 AZs) that have NAT Gateways and relevant route tables
+- **High Availability**: Deploy instances across multiple availability zones
 
 **Parameters**:
 ```yaml
 CreateNewVPC: no
 ExistingVPC: vpc-xxxxx
-ExistingPrivateSubnet: subnet-xxxxx
+ExistingPrivateSubnet: subnet-xxxxx  # First AZ
+ExistingPrivateSubnet2: subnet-yyyyy # Second AZ (optional but recommended)
 ```
 
 **Requirements for existing VPC**:
-- Private subnets must have routes to dedicated NAT Gateways for redundant internet access
+- Private subnets in at least 2 availability zones (recommended)
+- Each private subnet must have routes to dedicated NAT Gateways for redundant internet access
 - VPC must have DNS hostnames and DNS support enabled
-- Security group allows outbound traffic to internet (HTTPS/443)ad
+- Security group allows outbound traffic to internet (HTTPS/443)
 
 ## Architecture
 
@@ -346,14 +351,15 @@ Approximate monthly costs for us-east-1 region:
 
 | Resource | Monthly Cost |
 |----------|-------------|
-| EC2 t3.large (24/7) | ~$60 |
-| NAT Gateway (if created) | ~$32 + data transfer |
+| EC2 t3.large x2 (24/7, 2 AZs) | ~$120 |
+| NAT Gateway x2 (if created) | ~$64 + data transfer |
 | Lambda executions | < $1 |
 | Secrets Manager | $0.40 |
-| **Total (new VPC)** | **~$95/month** |
-| **Total (existing VPC)** | **~$63/month** |
+| **Total (new VPC, multi-AZ)** | **~$185/month** |
+| **Total (existing VPC, multi-AZ)** | **~$121/month** |
+| **Total (single AZ)** | **~$95/month** |
 
-*Costs vary by region, instance type, and data transfer volume.*
+*Costs vary by region, instance type, and data transfer volume. Multi-AZ deployment recommended for production.*
 
 ## Security Considerations
 
@@ -366,10 +372,9 @@ Approximate monthly costs for us-east-1 region:
 
 ## Limitations
 
-- ❌ **No high availability** - Single instance, single AZ
-- ❌ **No auto scaling** - Fixed capacity
-- ❌ **Single point of failure** - Instance failure requires manual intervention
+- ❌ **No auto scaling** - Fixed capacity (single instance per AZ)
 - ❌ **Manual scaling** - Capacity adjustments require stack updates
+- ❌ **Instance-level redundancy** - Instance failure requires manual intervention (stack re-creation)
 
 ## Use Cases
 
@@ -377,13 +382,18 @@ Approximate monthly costs for us-east-1 region:
 - Development and testing environments
 - Proof-of-concept deployments
 - Static/predictable workloads
-- Cost-optimized deployments
+- Cost-optimized deployments with multi-AZ redundancy
 - Small to medium organizations
+- Production workloads with predictable traffic patterns
+
+**✅ Built-in redundancy:**
+- Multi-AZ deployment support (2 availability zones)
+- Automatic failover between zones
+- Redundant NAT Gateways for high availability
 
 **⚠️ Considerations for production:**
-- Single AZ deployment (plan for availability zone failures)
-- Fixed capacity (monitor usage and scale manually if needed)
-- Consider deploying multiple stacks across AZs for redundancy
+- Fixed capacity per AZ (monitor usage and scale manually if needed)
+- Instance failures require stack re-creation (automated via CloudFormation)
 
 ## Naming Convention
 
