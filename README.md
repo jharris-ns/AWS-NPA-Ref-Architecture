@@ -363,12 +363,12 @@ Approximate monthly costs for us-east-1 region:
 
 ## Security Considerations
 
-✅ **No secrets in user data** - Token passed via SSM only
-✅ **No public IPs** - Instance in private subnet
-✅ **Egress-only security group** - No inbound rules
-✅ **IAM least privilege** - Minimal permissions
-✅ **Secrets Manager** - Encrypted token storage
-✅ **SSM Session Manager** - No SSH keys needed
+- ✅ **No secrets in user data** - Token passed via SSM only
+- ✅ **No public IPs** - Instance in private subnet
+- ✅ **Egress-only security group** - No inbound rules
+- ✅ **IAM least privilege** - Minimal permissions
+- ✅ **Secrets Manager** - Encrypted token storage
+- ✅ **SSM Session Manager** - No SSH keys needed
 
 ## Limitations
 
