@@ -40,7 +40,7 @@ ExistingPrivateSubnet: subnet-xxxxx
 **Requirements for existing VPC**:
 - Private subnets must have routes to dedicated NAT Gateways for redundant internet access
 - VPC must have DNS hostnames and DNS support enabled
-- Security group allows outbound traffic to internet (HTTPS/443)
+- Security group allows outbound traffic to internet (HTTPS/443)ad
 
 ## Architecture
 
@@ -118,8 +118,33 @@ Lambda environment variables allow tuning:
 - Amazon VPC with subnet that has internet connectivity (NAT Gateway) - **OR** choose to create new VPC
 - AWS Systems Manager enabled
 - Netskope API v2 Token with infrastructure and application management permissions
-- NPA Publisher AMI ID for your region
-- S3 bucket for Lambda deployment package (any region)
+- NPA Publisher AMI ID for your region (see command below)
+- S3 bucket for Lambda deployment package (**must be in same region as deployment**)
+
+### Get NPA Publisher AMI ID
+
+Use the helper script to find the latest AMI:
+
+```bash
+# Get AMI for your default region
+bash scripts/get-ami.sh
+
+# Get AMI for specific region
+bash scripts/get-ami.sh eu-west-1
+```
+
+Or manually query AWS:
+
+```bash
+aws ec2 describe-images \
+  --owners aws-marketplace \
+  --filters "Name=name,Values=*Netskope Private Access Publisher*" \
+  --region us-east-1 \
+  --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+  --output text
+```
+
+Change `--region` to match your deployment region (e.g., `eu-west-1`, `us-west-2`, `ap-southeast-1`).
 
 ## Deployment
 
@@ -161,36 +186,35 @@ aws cloudformation create-stack \
 
 ```
 AWS-NPA-Ref-Architecture/
-├── README.md                              # This file
+├── README.md                              # This file - overview and deployment guide
 ├── QUICKSTART.md                          # Quick deployment guide
 ├── deploy.sh                              # Interactive deployment script
 ├── deploy-example.sh                      # Example deployment script
-├── package-lambda.sh                      # Lambda packaging script
+├── docs/
+│   └── DEVOPS-NOTES.md                    # Technical deep-dive (SSM, Lambda internals)
 ├── scripts/
+│   ├── get-ami.sh                         # Helper script to find latest AMI
 │   ├── lambda_function.py                 # Lambda function source
-│   └── npa-publisher-lambda.zip           # Pre-packaged Lambda
+│   ├── npa-publisher-lambda.zip           # Pre-packaged Lambda
+│   └── package-lambda.sh                  # Lambda packaging script
 └── templates/
     └── npa-publisher-single-instance.yaml # CloudFormation template
 ```
 
 ## Lambda Function Details
 
-The Lambda function (`lambda_function.py`) includes:
+The Lambda function (`scripts/lambda_function.py`) handles publisher lifecycle:
 
-### Main Handler
+### Main Components
 - `lambda_handler()` - Routes CloudFormation events (CREATE/UPDATE/DELETE)
-
-### Create Flow
 - `handle_create()` - Full publisher registration workflow
-- `wait_for_instance_running()` - EC2 state polling
-- `wait_for_command_completion()` - SSM command monitoring
-
-### Delete Flow
-- `handle_delete()` - Publisher deregistration workflow
-
-### Utilities
+- `handle_delete()` - Publisher deregistration and cleanup
+- `wait_for_instance_running()` - EC2 state polling with timeout
+- `wait_for_command_completion()` - SSM command status monitoring
 - `call_netskope_api()` - Netskope REST API v2 wrapper
 - `get_secret()` - Secrets Manager integration
+
+**For detailed technical documentation**, including SSM integration details, error handling, retry logic, and troubleshooting, see [DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md).
 
 ## Lambda Packaging
 
@@ -201,6 +225,9 @@ The Lambda function requires Python dependencies (requests, urllib3, certifi). T
 A pre-built package is included at `scripts/npa-publisher-lambda.zip`:
 
 ```bash
+# IMPORTANT: S3 bucket must be in the same region as your deployment
+REGION=us-east-1  # Change to match your deployment region
+
 # Upload to your S3 bucket
 aws s3 cp scripts/npa-publisher-lambda.zip s3://my-bucket/
 
@@ -209,13 +236,15 @@ aws s3 cp scripts/npa-publisher-lambda.zip s3://my-bucket/
 # LambdaS3Key: npa-publisher-lambda.zip
 ```
 
+**Note**: CloudFormation requires the S3 bucket to be in the same region where you're deploying the stack.
+
 ### Option 2: Build from Source
 
 Use the included packaging script:
 
 ```bash
 # Package Lambda with dependencies
-./package-lambda.sh
+./scripts/package-lambda.sh
 
 # Upload to S3
 aws s3 cp scripts/npa-publisher-lambda.zip s3://my-bucket/
@@ -338,23 +367,23 @@ Approximate monthly costs for us-east-1 region:
 ## Limitations
 
 - ❌ **No high availability** - Single instance, single AZ
-- ❌ **No auto scaling** - Manual scaling only
-- ❌ **Single point of failure** - If instance fails, manual intervention needed
-- ❌ **Fixed capacity** - Cannot handle traffic spikes automatically
+- ❌ **No auto scaling** - Fixed capacity
+- ❌ **Single point of failure** - Instance failure requires manual intervention
+- ❌ **Manual scaling** - Capacity adjustments require stack updates
 
-## When to Use This Version
+## Use Cases
 
-**✅ Use single instance version when:**
-- Development or testing environments
+**✅ Ideal for:**
+- Development and testing environments
+- Proof-of-concept deployments
 - Static/predictable workloads
-- Cost optimization is priority
-- Simplicity is more important than HA
+- Cost-optimized deployments
+- Small to medium organizations
 
-**❌ Use auto scaling version when:**
-- Production workloads
-- Variable traffic patterns
-- High availability required
-- Multiple availability zones needed
+**⚠️ Considerations for production:**
+- Single AZ deployment (plan for availability zone failures)
+- Fixed capacity (monitor usage and scale manually if needed)
+- Consider deploying multiple stacks across AZs for redundancy
 
 ## Naming Convention
 
@@ -371,13 +400,20 @@ Valid App Names:
 
 This allows the Lambda function to identify which apps belong to this publisher.
 
-## Support
+## Support & Troubleshooting
 
-For issues with:
-- **This implementation**: Check CloudWatch Logs, SSM command history
-- **Netskope API**: Consult [Netskope REST API v2 Documentation](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
-- **AWS Services**: Check AWS documentation for CloudFormation, Lambda, SSM
+For issues with deployment or operation:
+
+1. **Check CloudWatch Logs**: `/aws/lambda/<PublisherGroupName>-RegistrationHandler`
+2. **Review SSM Command History**: Systems Manager → Run Command → Command history
+3. **View Stack Events**: CloudFormation console for detailed error messages
+4. **Read Technical Docs**: See [DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md) for detailed troubleshooting
+
+**External Documentation:**
+- [Netskope REST API v2](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
+- [AWS Systems Manager](https://docs.aws.amazon.com/systems-manager/)
+- [CloudFormation Custom Resources](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-custom-resources.html)
 
 ## License
 
-Same as parent project - Apache License 2.0
+Apache License 2.0
