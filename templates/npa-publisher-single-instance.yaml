@@ -50,6 +50,11 @@ Metadata:
           - LambdaS3Key
       -
         Label:
+          default: "Operational parameters"
+        Parameters:
+          - PublisherReplacementTrigger
+      -
+        Label:
           default: "Cost allocation and tagging"
         Parameters:
           - CostCenterTag
@@ -86,6 +91,8 @@ Metadata:
         default: S3 bucket name for Lambda package (bucket name only, not s3:// URI)
       LambdaS3Key:
         default: S3 key/path for Lambda package (e.g., npa-publisher-lambda.zip)
+      PublisherReplacementTrigger:
+        default: Publisher replacement trigger (change value to force instance replacement)
 
 Parameters:
   NPAPublisherGroupName:
@@ -240,6 +247,13 @@ Parameters:
     Description: 'S3 key for Lambda deployment package (e.g., npa-publisher-lambda.zip or path/to/lambda.zip)'
     Type: String
     Default: 'npa-publisher-lambda.zip'
+
+  PublisherReplacementTrigger:
+    Description: 'Change this value to force replacement of publisher instances (increment number to trigger update)'
+    Type: String
+    Default: '1'
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: 'Must be a positive integer'
 
 Conditions:
   ToProvisionNewAPIToken: !Equals
@@ -715,27 +729,113 @@ Resources:
                       - !Sub '${NPAPublisherGroupName}-*'
 
   # ==============================================================
+  # VPC Endpoints for Systems Manager
+  # ==============================================================
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVPC
+    Properties:
+      GroupName: !Sub '${NPAPublisherGroupName}-VPCEndpoint-SecurityGroup'
+      GroupDescription: "Security group for Systems Manager VPC endpoints"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NPAPublisherSecurityGroup
+          Description: "Allow HTTPS from NPA Publishers"
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-VPCEndpoint-SecurityGroup'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  SSMVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPC
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  EC2MessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPC
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SSMMessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPC
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ==============================================================
   # Security Group
   # ==============================================================
   NPAPublisherSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${NPAPublisherGroupName}-SecurityGroup'
-      GroupDescription: "Security group with only egress rule"
+      GroupDescription: "Security group with restrictive egress rules for Netskope and Systems Manager"
       VpcId:
         Fn::If:
           - CreateVPC
           - !Ref VPC
           - !Ref ExistingVPC
       SecurityGroupEgress:
+        # Netskope NewEdge Data Center IP Ranges
         - IpProtocol: tcp
-          FromPort: 0
-          ToPort: 65535
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: udp
-          FromPort: 0
-          ToPort: 65535
-          CidrIp: 0.0.0.0/0
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 8.36.116.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 8.39.144.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 31.186.239.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 163.116.128.0/17
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 162.10.0.0/17
+          Description: "Netskope NewEdge DC"
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-SecurityGroup'
@@ -745,6 +845,18 @@ Resources:
           Value: !Ref ProjectTag
         - Key: Environment
           Value: !Ref EnvironmentTag
+
+  # VPC Endpoint Egress Rule (only when using new VPC with VPC endpoints)
+  VPCEndpointEgressRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: CreateVPC
+    Properties:
+      GroupId: !Ref NPAPublisherSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: "AWS Systems Manager via VPC Endpoints"
 
   # ==============================================================
   # EC2 Instance
@@ -865,6 +977,7 @@ Resources:
       InstanceId: !Ref NPAPublisherInstance
       PublisherGroupName: !Ref NPAPublisherGroupName
       AccountId: !Ref AWS::AccountId
+      ReplacementTrigger: !Ref PublisherReplacementTrigger
 
   NPAPublisherRegistration2:
     Type: Custom::NPAPublisher
@@ -874,6 +987,7 @@ Resources:
       InstanceId: !Ref NPAPublisherInstance2
       PublisherGroupName: !Ref NPAPublisherGroupName
       AccountId: !Ref AWS::AccountId
+      ReplacementTrigger: !Ref PublisherReplacementTrigger
 
 Outputs:
   PublisherInstanceId:

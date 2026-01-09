@@ -99,7 +99,7 @@ aws s3 cp scripts/npa-publisher-lambda.zip s3://my-npa-lambda-bucket/
 **Option A: Interactive Deployment (Recommended)**
 
 ```bash
-./deploy.sh my-stack-name my-npa-lambda-bucket
+../scripts/deploy.sh my-stack-name my-npa-lambda-bucket
 
 # Follow the interactive prompts:
 # 1. Choose VPC mode (create new or use existing)
@@ -446,6 +446,21 @@ aws s3 rm s3://my-lambda-bucket/npa-publisher-lambda.zip
 - Deletes VPC resources (if created by stack)
 - Removes Secrets Manager secret
 
+## Security Features
+
+This deployment includes enterprise-grade security controls:
+
+**When creating a new VPC**:
+- ✅ **Restrictive Security Groups** - Only Netskope NewEdge IP ranges allowlisted (no 0.0.0.0/0)
+- ✅ **VPC Endpoints** - Systems Manager traffic stays within AWS network (3 endpoints: ssm, ec2messages, ssmmessages)
+- ✅ **Private Subnets** - No public IPs assigned to publishers
+- ✅ **NAT Gateways** - Dedicated per AZ for redundant Netskope connectivity
+- ✅ **Secrets Manager** - API token encrypted at rest
+- ✅ **No SSH Keys Required** - Use AWS Systems Manager Session Manager
+- ✅ **No Secrets in User Data** - Registration token passed via SSM command
+
+**For detailed security group requirements**, including Netskope NewEdge IP ranges, see the [full README](../README.md#security-group-requirements).
+
 ## Next Steps
 
 1. **Monitor Publisher Health**
@@ -467,8 +482,8 @@ aws s3 rm s3://my-lambda-bucket/npa-publisher-lambda.zip
 
 ## Additional Resources
 
-- [Full Documentation](README.md) - Comprehensive deployment guide
-- [DevOps Technical Notes](docs/DEVOPS-NOTES.md) - SSM and Lambda deep-dive
+- [Full Documentation](../README.md) - Comprehensive deployment guide
+- [DevOps Technical Notes](DEVOPS-NOTES.md) - SSM and Lambda deep-dive
 - [Netskope REST API v2](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
 - [AWS Systems Manager](https://docs.aws.amazon.com/systems-manager/)
 - [CloudFormation Best Practices](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best-practices.html)
@@ -478,7 +493,7 @@ aws s3 rm s3://my-lambda-bucket/npa-publisher-lambda.zip
 **Issues with deployment?**
 1. Check Lambda logs: `/aws/lambda/<GroupName>-RegistrationHandler`
 2. Review SSM command history: Systems Manager → Run Command
-3. Read troubleshooting section in [DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)
+3. Read troubleshooting section in [DEVOPS-NOTES.md](DEVOPS-NOTES.md)
 
 **Need support?**
 - File issues on GitHub repository

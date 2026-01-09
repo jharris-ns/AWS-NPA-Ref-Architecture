@@ -6,15 +6,39 @@ Automated deployment of Netskope Private Access (NPA) Publishers using CloudForm
 
 This solution provides a highly available deployment of NPA Publishers with automatic registration to your Netskope tenant. It supports multi-AZ deployment for production redundancy and uses CloudFormation Custom Resources and AWS Systems Manager to handle the publisher setup without requiring manual intervention or exposing secrets.
 
+![Netskope Private Access](docs/images/npa_reference_architecture.png)
+
+## Documentation
+
+This project includes comprehensive documentation for deployment, operations, and troubleshooting:
+
+- **[QUICKSTART.md](docs/QUICKSTART.md)** - Get started in 10 minutes with a guided quick deployment
+- **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Complete deployment instructions with all configuration options, prerequisites, and verification steps
+- **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures for managing running deployments (replace publishers, update AMIs, scale instances, rotate tokens, monitoring)
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions with diagnostic commands
+- **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive into SSM integration, Lambda internals, and architecture decisions
+
+**Quick Links:**
+- New to the project? Start with **[QUICKSTART.md](docs/QUICKSTART.md)**
+- Need to deploy? See **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)**
+- Already deployed? Check **[OPERATIONS.md](docs/OPERATIONS.md)**
+- Having issues? See **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**
+
 ## VPC Deployment Options
 
 The template supports two deployment modes:
 
-### Option 1: Create New VPC (Recommended for Testing & Production)
+### Option 1: Create New VPC 
 
 - **Automatically creates**: VPC, Internet Gateway, NAT Gateways (2), Public & Private Subnets (2 AZs)
 - **Routing**: Configured automatically for redundant internet access
 - **High Availability**: Multi-AZ deployment with redundant NAT Gateways
+
+**When creating a new VPC** (CreateNewVPC: yes):
+- ✅ VPC endpoints are automatically created for Systems Manager (ssm, ec2messages, ssmmessages)
+- ✅ Security group is configured with restrictive egress rules (only Netskope IPs + VPC endpoints)
+- ✅ NAT Gateways remain in place for Netskope connectivity
+- ✅ No internet traffic required for Systems Manager
 
 **Parameters**:
 ```yaml
@@ -28,10 +52,13 @@ PrivateSubnetCIDR2: 10.0.4.0/24
 AvailabilityZone2: (optional, auto-selected if not specified)
 ```
 
-### Option 2: Use Existing VPC (Recommended for Production)
-Best for production deployments in your existing infrastructure:
+### Option 2: Use Existing VPC 
+
 - **Requires**: Existing VPC with private subnets (2 AZs) that have NAT Gateways and relevant route tables
 - **High Availability**: Deploy instances across multiple availability zones
+- **DNS** VPC must have DNS hostnames and DNS support enabled
+- **Security** Security group with the configuration described [here](#security-group-requirements)
+  - Netskope NewEdge Data Centers ([see IP ranges below](#netskope-newedge-data-center-ip-ranges))
 
 **Parameters**:
 ```yaml
@@ -41,11 +68,19 @@ ExistingPrivateSubnet: subnet-xxxxx  # First AZ
 ExistingPrivateSubnet2: subnet-yyyyy # Second AZ (optional but recommended)
 ```
 
-**Requirements for existing VPC**:
-- Private subnets in at least 2 availability zones (recommended)
-- Each private subnet must have routes to dedicated NAT Gateways for redundant internet access
-- VPC must have DNS hostnames and DNS support enabled
-- Security group allows outbound traffic to internet (HTTPS/443)
+**When using an existing VPC** (CreateNewVPC: no):
+- ⚠️ Security group is configured with restrictive egress rules for Netskope IPs only
+- ⚠️ You must ensure your VPC has either:
+  - **Option 1 (Recommended)**: VPC endpoints for Systems Manager in your VPC
+  - **Option 2**: Allow outbound HTTPS (443) to 0.0.0.0/0 for Systems Manager
+- ⚠️ If you don't have VPC endpoints, add this additional egress rule to your security group:
+    ```yaml
+    - IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: AWS Systems Manager (if no VPC endpoints)
+    ```
 
 ## Architecture
 
@@ -67,6 +102,28 @@ CloudFormation Stack
     │
     └─ Outputs (Instance ID, Private IP, etc.)
 ```
+
+## Security Group Requirements
+
+The NPA Publisher instances require outbound HTTPS (443) access to the following destinations:
+
+### AWS Systems Manager Endpoints
+The security group must allow outbound traffic to AWS Systems Manager endpoints for SSM agent functionality. These endpoints are regional and automatically resolved via AWS DNS.
+
+### Netskope NewEdge Data Center IP Ranges
+To ensure reliable connectivity to Netskope NewEdge Data Centers and prevent service disruptions, allowlist the following IP ranges for outbound HTTPS (443) traffic.
+
+**Reference**: [NewEdge IP Ranges for Allowlisting](https://docs.netskope.com/en/newedge-ip-ranges-for-allowlisting)
+
+| CIDR Block | IP Range | Description |
+|------------|----------|-------------|
+| `8.36.116.0/24` | 8.36.116.0 – 8.36.116.255 | NewEdge DC |
+| `8.39.144.0/24` | 8.39.144.0 – 8.39.144.255 | NewEdge DC |
+| `31.186.239.0/24` | 31.186.239.0 – 31.186.239.255 | NewEdge DC |
+| `163.116.128.0/17` | 163.116.128.0 – 163.116.255.255 | NewEdge DC |
+| `162.10.0.0/17` | 162.10.0.0 – 162.10.127.255 | NewEdge DC |
+
+**Note**: These IP ranges are used for both ingress and egress of NewEdge Data Centers. Publishers need outbound access to these ranges for registration and ongoing connectivity to Netskope infrastructure.
 
 ## How It Works
 
@@ -90,7 +147,7 @@ CloudFormation Stack
 4. **Custom Resource returns SUCCESS**
 5. **CloudFormation deletes EC2 instance**
 
-## Key Features
+## Lambda Function Key Features
 
 ### 1. Smart EC2 State Checking
 - Verifies instance is `running` before polling SSM
@@ -100,7 +157,6 @@ CloudFormation Stack
 ### 2. Exponential Backoff for SSM
 - Intelligent wait times: starts at 5s, gradually increases to 30s
 - Typical SSM registration completes in 2-4 minutes
-- Reduces API calls while ensuring quick detection
 
 ```python
 wait_times = [5, 10, 15, 20, 30, 30, 30, 30, 30, 30]  # seconds
@@ -117,87 +173,28 @@ Lambda environment variables allow tuning:
 - `SSM_READY_TIMEOUT`: 240 seconds (SSM agent online)
 - `COMMAND_TIMEOUT`: 300 seconds (registration command)
 
-## Prerequisites
+## Getting Started
 
-- AWS Account with appropriate permissions
-- Amazon VPC with subnet that has internet connectivity (NAT Gateway) - **OR** choose to create new VPC
-- AWS Systems Manager enabled
-- Netskope API v2 Token with infrastructure and application management permissions
-- NPA Publisher AMI ID for your region (see command below)
-- S3 bucket for Lambda deployment package (**must be in same region as deployment**)
-
-### Get NPA Publisher AMI ID
-
-Use the helper script to find the latest AMI:
-
-```bash
-# Get AMI for your default region
-bash scripts/get-ami.sh
-
-# Get AMI for specific region
-bash scripts/get-ami.sh eu-west-1
-```
-
-Or manually query AWS:
-
-```bash
-aws ec2 describe-images \
-  --owners aws-marketplace \
-  --filters "Name=name,Values=*Netskope Private Access Publisher*" \
-  --region us-east-1 \
-  --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-  --output text
-```
-
-Change `--region` to match your deployment region (e.g., `eu-west-1`, `us-west-2`, `ap-southeast-1`).
-
-## Deployment
-
-### Option 1: AWS Console
-
-1. Navigate to CloudFormation in AWS Console
-2. Choose **Create Stack** → **With new resources**
-3. Upload template: `npa-publisher-single-instance.yaml`
-4. Fill in parameters:
-   - **Netskope Tenant FQDN**: `mytenant.goskope.com`
-   - **VPC**: Select your VPC
-   - **Subnet**: Select single private subnet with NAT Gateway
-   - **Publisher Group Name**: e.g., `MyNPAPublisher`
-   - **AMI ID**: Get from AWS Marketplace or Netskope UI
-   - **Key Pair**: Select existing EC2 key pair
-   - **API Token**: Enter Netskope API v2 token
-5. Acknowledge IAM resource creation
-6. Click **Create Stack**
-
-### Option 2: AWS CLI
-
-```bash
-aws cloudformation create-stack \
-  --stack-name netskope-npa-publisher \
-  --template-body file://npa-publisher-single-instance.yaml \
-  --parameters \
-    ParameterKey=NetskopeTenantFQDN,ParameterValue=mytenant.goskope.com \
-    ParameterKey=VPC,ParameterValue=vpc-xxxxx \
-    ParameterKey=NPAPublisherSubnet,ParameterValue=subnet-xxxxx \
-    ParameterKey=NPAPublisherGroupName,ParameterValue=MyNPAPublisher \
-    ParameterKey=NPAPublisherAMIId,ParameterValue=ami-xxxxx \
-    ParameterKey=NPAPublisherKey,ParameterValue=my-keypair \
-    ParameterKey=NetskopeAPIToken,ParameterValue=your-api-token \
-    ParameterKey=ProvisionNewAPIToken,ParameterValue=yes \
-  --capabilities CAPABILITY_NAMED_IAM
-```
+For deployment instructions, see:
+- **[QUICKSTART.md](docs/QUICKSTART.md)** - Quick 10-minute deployment guide
+- **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Complete deployment documentation with all options
 
 ## Project Structure
 
 ```
 AWS-NPA-Ref-Architecture/
-├── README.md                              # This file - overview and deployment guide
-├── QUICKSTART.md                          # Quick deployment guide
-├── deploy.sh                              # Interactive deployment script
-├── deploy-example.sh                      # Example deployment script
+├── README.md                              # This file - Architecture overview
 ├── docs/
-│   └── DEVOPS-NOTES.md                    # Technical deep-dive (SSM, Lambda internals)
+│   ├── QUICKSTART.md                      # Quick 10-minute deployment guide
+│   ├── DEPLOYMENT_GUIDE.md                # Complete deployment documentation
+│   ├── OPERATIONS.md                      # Operational procedures (replace publishers, updates, monitoring)
+│   ├── TROUBLESHOOTING.md                 # Common issues and solutions
+│   ├── DEVOPS-NOTES.md                    # Technical deep-dive (SSM, Lambda internals)
+│   └── images/
+│       └── npa_reference_architecture.png # Architecture diagram
 ├── scripts/
+│   ├── deploy.sh                          # Interactive deployment script
+│   ├── deploy-example.sh                  # Example deployment script
 │   ├── get-ami.sh                         # Helper script to find latest AMI
 │   ├── lambda_function.py                 # Lambda function source
 │   ├── npa-publisher-lambda.zip           # Pre-packaged Lambda
@@ -221,130 +218,6 @@ The Lambda function (`scripts/lambda_function.py`) handles publisher lifecycle:
 
 **For detailed technical documentation**, including SSM integration details, error handling, retry logic, and troubleshooting, see [DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md).
 
-## Lambda Packaging
-
-The Lambda function requires Python dependencies (requests, urllib3, certifi). Two options:
-
-### Option 1: Use Pre-packaged Lambda (Recommended)
-
-A pre-built package is included at `scripts/npa-publisher-lambda.zip`:
-
-```bash
-# IMPORTANT: S3 bucket must be in the same region as your deployment
-REGION=us-east-1  # Change to match your deployment region
-
-# Upload to your S3 bucket
-aws s3 cp scripts/npa-publisher-lambda.zip s3://my-bucket/
-
-# Update template parameters:
-# LambdaS3Bucket: my-bucket
-# LambdaS3Key: npa-publisher-lambda.zip
-```
-
-**Note**: CloudFormation requires the S3 bucket to be in the same region where you're deploying the stack.
-
-### Option 2: Build from Source
-
-Use the included packaging script:
-
-```bash
-# Package Lambda with dependencies
-./scripts/package-lambda.sh
-
-# Upload to S3
-aws s3 cp scripts/npa-publisher-lambda.zip s3://my-bucket/
-```
-
-Or manually:
-
-```bash
-# Create package directory
-mkdir -p scripts/package
-
-# Install dependencies
-pip install requests urllib3 certifi -t scripts/package/
-
-# Copy Lambda function
-cp scripts/lambda_function.py scripts/package/
-
-# Create deployment package
-cd scripts/package
-zip -r ../npa-publisher-lambda.zip .
-cd ../..
-```
-
-## Monitoring
-
-### CloudWatch Logs
-
-Lambda function logs are available in:
-```
-/aws/lambda/<PublisherGroupName>LambdaFunction
-```
-
-Key log messages to look for:
-- `Creating a new publisher: <name>`
-- `Successfully obtained registration token`
-- `Instance is running, proceeding to SSM check`
-- `Instance is online in SSM!`
-- `Command completed successfully`
-- `Publisher registration completed. Updated N private applications`
-
-### SSM Command History
-
-View SSM Run Command executions in AWS Console:
-- **Systems Manager → Run Command → Command history**
-- Look for commands with comment: "Registering NPA publisher with Netskope"
-
-### Stack Events
-
-Monitor CloudFormation events to track:
-- EC2 instance creation
-- Custom resource creation (publisher registration)
-- Any failures or rollbacks
-
-## Troubleshooting
-
-### Issue: Stack stuck on "CREATE_IN_PROGRESS"
-
-**Cause**: Custom resource waiting for Lambda response
-
-**Solution**:
-1. Check Lambda logs in CloudWatch
-2. Look for errors or timeout messages
-3. Verify instance has SSM agent running: `aws ssm describe-instance-information`
-
-### Issue: "Instance did not become available in Systems Manager"
-
-**Cause**: SSM agent not running or network connectivity issue
-
-**Solution**:
-1. Verify instance is in running state
-2. Check security group allows outbound HTTPS (443)
-3. Verify subnet has route to internet via NAT Gateway
-4. Check IAM instance profile has `AmazonSSMManagedInstanceCore` policy
-5. Connect via EC2 Instance Connect and check: `systemctl status amazon-ssm-agent`
-
-### Issue: "Failed to get registration token"
-
-**Cause**: Netskope API authentication or permissions issue
-
-**Solution**:
-1. Verify API token in Secrets Manager is correct
-2. Check token has infrastructure management permissions
-3. Verify tenant FQDN is correct (e.g., `mytenant.goskope.com`)
-4. Test API manually: `curl -H "Netskope-Api-Token: <token>" https://<tenant>/api/v2/infrastructure/publishers`
-
-### Issue: Command execution failed
-
-**Cause**: `npa_publisher_wizard` script failed on instance
-
-**Solution**:
-1. Check Lambda logs for stderr output
-2. Connect to instance via Session Manager
-3. Check `/var/log/amazon/ssm/` for SSM agent logs
-4. Manually run: `sudo /home/ubuntu/npa_publisher_wizard -token "test"`
-
 ## Cost Estimation
 
 Approximate monthly costs for us-east-1 region:
@@ -353,22 +226,27 @@ Approximate monthly costs for us-east-1 region:
 |----------|-------------|
 | EC2 t3.large x2 (24/7, 2 AZs) | ~$120 |
 | NAT Gateway x2 (if created) | ~$64 + data transfer |
+| VPC Endpoints x3 (ssm, ec2messages, ssmmessages, 2 AZs) | ~$44 |
 | Lambda executions | < $1 |
 | Secrets Manager | $0.40 |
-| **Total (new VPC, multi-AZ)** | **~$185/month** |
+| **Total (new VPC, multi-AZ)** | **~$229/month** |
 | **Total (existing VPC, multi-AZ)** | **~$121/month** |
 | **Total (single AZ)** | **~$95/month** |
 
 *Costs vary by region, instance type, and data transfer volume. Multi-AZ deployment recommended for production.*
 
+**Note**: VPC endpoints reduce NAT Gateway data transfer costs for Systems Manager traffic. The VPC endpoint cost is offset by reduced NAT Gateway data transfer charges, making the actual increase smaller than shown above.
+
 ## Security Considerations
 
 - ✅ **No secrets in user data** - Token passed via SSM only
 - ✅ **No public IPs** - Instance in private subnet
-- ✅ **Egress-only security group** - No inbound rules
+- ✅ **Restrictive egress rules** - Only Netskope NewEdge IPs allowlisted (no 0.0.0.0/0)
+- ✅ **VPC endpoints for Systems Manager** - Private connectivity without internet routing
 - ✅ **IAM least privilege** - Minimal permissions
 - ✅ **Secrets Manager** - Encrypted token storage
 - ✅ **SSM Session Manager** - No SSH keys needed
+- ✅ **No inbound rules** - Publishers only initiate outbound connections
 
 ## Limitations
 
@@ -410,19 +288,20 @@ Valid App Names:
 
 This allows the Lambda function to identify which apps belong to this publisher.
 
-## Support & Troubleshooting
+## Additional Resources
 
-For issues with deployment or operation:
+### Project Documentation
+- **[QUICKSTART.md](docs/QUICKSTART.md)** - Quick 10-minute deployment guide
+- **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Complete deployment instructions
+- **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures (replace publishers, AMI updates, monitoring)
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+- **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive (SSM, Lambda internals)
 
-1. **Check CloudWatch Logs**: `/aws/lambda/<PublisherGroupName>-RegistrationHandler`
-2. **Review SSM Command History**: Systems Manager → Run Command → Command history
-3. **View Stack Events**: CloudFormation console for detailed error messages
-4. **Read Technical Docs**: See [DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md) for detailed troubleshooting
-
-**External Documentation:**
+### External Resources
 - [Netskope REST API v2](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
 - [AWS Systems Manager](https://docs.aws.amazon.com/systems-manager/)
 - [CloudFormation Custom Resources](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-custom-resources.html)
+- [NewEdge IP Ranges](https://docs.netskope.com/en/newedge-ip-ranges-for-allowlisting)
 
 ## License
 
