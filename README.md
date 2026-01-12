@@ -24,6 +24,58 @@ This project includes comprehensive documentation for deployment, operations, an
 - Already deployed? Check **[OPERATIONS.md](docs/OPERATIONS.md)**
 - Having issues? See **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**
 
+## IAM Permissions Required
+
+To deploy this CloudFormation template, the deploying user or role needs permissions to create and manage multiple AWS resources. A complete IAM policy with all required permissions is provided in **[templates/deployment-iam-policy.json](templates/deployment-iam-policy.json)**.
+
+### Permission Summary
+
+The deployment requires permissions for the following AWS services:
+
+| Service | Key Permissions | Purpose |
+|---------|----------------|---------|
+| **CloudFormation** | Create/update/delete stacks | Deploy and manage infrastructure |
+| **EC2** | VPC, subnets, NAT gateways, security groups, instances | Network infrastructure and compute |
+| **VPC Endpoints** | Create/manage interface endpoints | Private Systems Manager connectivity |
+| **IAM** | Create/manage roles and instance profiles | Lambda execution and EC2 instance roles |
+| **Lambda** | Create/invoke functions | Publisher registration automation |
+| **Secrets Manager** | Create/manage secrets | Secure API token storage |
+| **S3** | Read objects | Lambda deployment package access |
+| **Systems Manager** | Send commands, describe instances | Publisher registration via SSM |
+| **CloudWatch Logs** | Create log groups/streams | Lambda function logging |
+
+### Applying the Policy
+
+**Option 1: Create a dedicated deployment user/role** (Recommended)
+
+```bash
+# Create IAM policy
+aws iam create-policy \
+  --policy-name NPAPublisherDeploymentPolicy \
+  --policy-document file://templates/deployment-iam-policy.json
+
+# Attach to a user or role
+aws iam attach-user-policy \
+  --user-name your-deployment-user \
+  --policy-arn arn:aws:iam::YOUR-ACCOUNT-ID:policy/NPAPublisherDeploymentPolicy
+```
+
+**Option 2: Use existing admin role**
+
+If you have administrative access, you can deploy directly. The policy file serves as documentation of what permissions are used.
+
+**Option 3: Request permissions from your AWS administrator**
+
+Provide the **[templates/deployment-iam-policy.json](templates/deployment-iam-policy.json)** file to your AWS administrator to create appropriate permissions.
+
+### Least Privilege Considerations
+
+The provided policy follows AWS least privilege best practices:
+- IAM role permissions are scoped to resources with `NPAPublisher` or `RegistrationHandler` in the name
+- Secrets Manager access is limited to secrets with `NetskopeAPIToken-` prefix
+- Lambda and CloudWatch Logs permissions are scoped to the registration handler function
+- No `*:*` permissions are granted
+
 ## VPC Deployment Options
 
 The template supports two deployment modes:
@@ -200,7 +252,8 @@ AWS-NPA-Ref-Architecture/
 │   ├── npa-publisher-lambda.zip           # Pre-packaged Lambda
 │   └── package-lambda.sh                  # Lambda packaging script
 └── templates/
-    └── npa-publisher-single-instance.yaml # CloudFormation template
+    ├── npa-publisher-single-instance.yaml # CloudFormation template
+    └── deployment-iam-policy.json         # IAM policy for deployment permissions
 ```
 
 ## Lambda Function Details
