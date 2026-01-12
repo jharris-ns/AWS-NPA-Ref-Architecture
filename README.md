@@ -60,9 +60,9 @@ aws iam attach-user-policy \
   --policy-arn arn:aws:iam::YOUR-ACCOUNT-ID:policy/NPAPublisherDeploymentPolicy
 ```
 
-**Option 2: Use existing administrative role**
+**Option 2: Use existing IAM role with sufficient privileges**
 
-If you have administrative access, you can deploy directly. The policy file serves as documentation of what permissions are used.
+If you already have the necessary AWS permissions, you can deploy directly. The provided policy document serves as reference documentation.
 
 **Option 3: Request permissions from your AWS administrator**
 
