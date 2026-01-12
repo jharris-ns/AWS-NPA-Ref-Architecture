@@ -6,7 +6,7 @@ Complete deployment instructions for Netskope Private Access Publishers on AWS.
 
 Before you begin, ensure you have:
 
-- AWS Account with appropriate permissions
+- **AWS Account with appropriate permissions** - See [IAM Permissions Required](../README.md#iam-permissions-required) in README.md or review [templates/deployment-iam-policy.json](../templates/deployment-iam-policy.json)
 - Amazon VPC with subnet that has internet connectivity (NAT Gateway) - **OR** choose to create new VPC
 - AWS Systems Manager enabled
 - Netskope API v2 Token with infrastructure and application management permissions
