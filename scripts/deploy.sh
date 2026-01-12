@@ -21,7 +21,7 @@ S3_BUCKET="${2}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 # CloudFormation template
-TEMPLATE_FILE="npa-publisher-single-instance.yaml"
+TEMPLATE_FILE="netskope-ref-architecture-npa.yaml"
 
 # Lambda package
 LAMBDA_ZIP="npa-publisher-lambda.zip"

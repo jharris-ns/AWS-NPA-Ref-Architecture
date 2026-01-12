@@ -111,7 +111,7 @@ aws s3 cp scripts/npa-publisher-lambda.zip s3://my-npa-lambda-bucket/
 
 1. Go to AWS CloudFormation Console
 2. Click **Create Stack** → **With new resources**
-3. Upload `templates/npa-publisher-single-instance.yaml`
+3. Upload `templates/netskope-ref-architecture-npa.yaml`
 4. Fill in the parameters (see below)
 5. Check **I acknowledge that AWS CloudFormation might create IAM resources**
 6. Click **Create Stack**
@@ -121,7 +121,7 @@ aws s3 cp scripts/npa-publisher-lambda.zip s3://my-npa-lambda-bucket/
 ```bash
 aws cloudformation create-stack \
   --stack-name netskope-npa-publisher \
-  --template-body file://templates/npa-publisher-single-instance.yaml \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
   --parameters \
     ParameterKey=NetskopeTenantFQDN,ParameterValue=mytenant.goskope.com \
     ParameterKey=CreateNewVPC,ParameterValue=yes \
@@ -143,7 +143,7 @@ aws cloudformation create-stack \
 ```bash
 aws cloudformation create-stack \
   --stack-name netskope-npa-publisher \
-  --template-body file://templates/npa-publisher-single-instance.yaml \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
   --parameters \
     ParameterKey=NetskopeTenantFQDN,ParameterValue=mytenant.goskope.com \
     ParameterKey=CreateNewVPC,ParameterValue=no \
@@ -351,7 +351,12 @@ Publisher Group Name: MyPublisher
   - MyApp
 ```
 
-The Lambda function automatically assigns the publisher to apps matching this naming convention.
+**How it works:**
+- During stack creation, the Lambda function **automatically discovers and assigns** the publisher to all existing apps matching this naming convention
+- Apps can be created before or after deployment - the initial deployment will assign publishers to all matching apps
+- On stack deletion, the Lambda function automatically removes the publisher from all associated apps
+
+**Note:** If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI, or use the [PublisherReplacementTrigger parameter](OPERATIONS.md#replace-publisher-in-specific-az) to force re-assignment.
 
 ## Troubleshooting
 

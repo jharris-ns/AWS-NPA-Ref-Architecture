@@ -57,7 +57,7 @@ Use the interactive deployment script for guided setup:
 
 1. Navigate to CloudFormation in AWS Console
 2. Choose **Create Stack** → **With new resources**
-3. Upload template: `templates/npa-publisher-single-instance.yaml`
+3. Upload template: `templates/netskope-ref-architecture-npa.yaml`
 4. Fill in parameters:
    - **Netskope Tenant FQDN**: `mytenant.goskope.com`
    - **VPC Configuration**: Choose to create new or use existing
@@ -75,7 +75,7 @@ Use the interactive deployment script for guided setup:
 ```bash
 aws cloudformation create-stack \
   --stack-name netskope-npa-publisher \
-  --template-body file://templates/npa-publisher-single-instance.yaml \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
   --parameters \
     ParameterKey=NetskopeTenantFQDN,ParameterValue=mytenant.goskope.com \
     ParameterKey=CreateNewVPC,ParameterValue=yes \
@@ -99,7 +99,7 @@ aws cloudformation create-stack \
 ```bash
 aws cloudformation create-stack \
   --stack-name netskope-npa-publisher \
-  --template-body file://templates/npa-publisher-single-instance.yaml \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
   --parameters \
     ParameterKey=NetskopeTenantFQDN,ParameterValue=mytenant.goskope.com \
     ParameterKey=CreateNewVPC,ParameterValue=no \

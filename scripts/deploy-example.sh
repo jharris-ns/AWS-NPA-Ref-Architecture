@@ -55,7 +55,7 @@ echo "Creating CloudFormation stack..."
 
 aws cloudformation create-stack \
   --stack-name "${STACK_NAME}" \
-  --template-body file://npa-publisher-single-instance.yaml \
+  --template-body file://netskope-ref-architecture-npa.yaml \
   --parameters \
     ParameterKey=NetskopeTenantFQDN,ParameterValue="${NETSKOPE_TENANT}" \
     ParameterKey=VPC,ParameterValue="${VPC_ID}" \
