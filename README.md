@@ -60,7 +60,7 @@ aws iam attach-user-policy \
   --policy-arn arn:aws:iam::YOUR-ACCOUNT-ID:policy/NPAPublisherDeploymentPolicy
 ```
 
-**Option 2: Use existing admin role**
+**Option 2: Use existing administrative role**
 
 If you have administrative access, you can deploy directly. The policy file serves as documentation of what permissions are used.
 
@@ -149,7 +149,7 @@ CloudFormation Stack
     │             ├─ Calls Netskope API to create publisher & get registration token
     │             ├─ Waits for instance to be running
     │             ├─ Waits for SSM Agent to be online
-    │             ├─ Sends SSM command: npa_publisher_wizard -token "<token>"
+    │             ├─ Sends SSM command: npa_publisher_wizard -token $REGISTRATION_TOKEN
     │             └─ Updates private applications
     │
     └─ Outputs (Instance ID, Private IP, etc.)
@@ -369,6 +369,8 @@ Publisher Group Name: MyPublisher
 ```
 
 **Why this matters:** The Lambda function automatically assigns the publisher to apps matching this naming convention. Apps that don't follow this pattern will not be automatically associated with your publisher.
+
+**Note:** Apps can be created before or after deployment. During stack creation, the Lambda function automatically discovers and assigns the publisher to all existing apps matching the naming convention. If you create new apps after deployment, you'll need to either manually assign the publisher in the Netskope UI, or use the [PublisherReplacementTrigger parameter](docs/OPERATIONS.md#replace-publisher-in-specific-az) to force automatic re-assignment.
 
 ## Additional Resources
 
