@@ -12,6 +12,7 @@ This solution provides a highly available deployment of NPA Publishers with auto
 
 This project includes comprehensive documentation for deployment, operations, and troubleshooting:
 
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed architecture overview covering network design, security best practices, high availability, and AWS Well-Architected Framework compliance
 - **[QUICKSTART.md](docs/QUICKSTART.md)** - Get started in 10 minutes with a guided quick deployment
 - **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Complete deployment instructions with all configuration options, prerequisites, and verification steps
 - **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures for managing running deployments (replace publishers, update AMIs, scale instances, rotate tokens, monitoring)
@@ -19,6 +20,7 @@ This project includes comprehensive documentation for deployment, operations, an
 - **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive into SSM integration, Lambda internals, and architecture decisions
 
 **Quick Links:**
+- Want to understand the architecture? See **[ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 - New to the project? Start with **[QUICKSTART.md](docs/QUICKSTART.md)**
 - Need to deploy? See **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)**
 - Already deployed? Check **[OPERATIONS.md](docs/OPERATIONS.md)**
@@ -64,7 +66,11 @@ aws iam attach-user-policy \
 
 If you already have the necessary AWS permissions, you can deploy directly. The provided policy document serves as reference documentation.
 
-**Option 3: Request permissions from your AWS administrator**
+**Option 3: Create an IAM role to assume**
+
+Create a dedicated role with deployment permissions that you can assume via CLI. See **[docs/IAM-ROLE-SETUP.md](docs/IAM-ROLE-SETUP.md)** for complete instructions.
+
+**Option 4: Request permissions from your AWS administrator**
 
 Provide the **[templates/deployment-iam-policy.json](templates/deployment-iam-policy.json)** file to your AWS administrator to create appropriate permissions.
 
@@ -88,7 +94,7 @@ The template supports two deployment modes:
 
 **When creating a new VPC** (CreateNewVPC: yes):
 - ✅ VPC endpoints are automatically created for Systems Manager (ssm, ec2messages, ssmmessages)
-- ✅ Security group is configured with restrictive egress rules (only Netskope IPs + VPC endpoints)
+- ⚠️ Security group allows all HTTPS egress (temporary workaround - see [Netskope IP Ranges](#netskope-ip-ranges))
 - ✅ NAT Gateways remain in place for Netskope connectivity
 - ✅ No internet traffic required for Systems Manager
 
@@ -121,12 +127,14 @@ ExistingPrivateSubnet2: subnet-yyyyy # Second AZ (optional but recommended)
 ```
 
 **When using an existing VPC** (CreateNewVPC: no):
-- ⚠️ Security group is configured with restrictive egress rules for Netskope IPs only
-- ⚠️ You must ensure your VPC has either:
-  - **Option 1 (Recommended)**: VPC endpoints for Systems Manager in your VPC
-  - **Option 2**: Allow outbound HTTPS (443) to 0.0.0.0/0 for Systems Manager
-- ⚠️ If you don't have VPC endpoints, add this additional egress rule to your security group:
+- ⚠️ Security group allows all HTTPS egress (temporary workaround - see [Netskope IP Ranges](#netskope-ip-ranges))
+- ✅ Systems Manager connectivity works by default (either via VPC endpoints or NAT Gateway)
+- ⚠️ Your VPC must have either:
+  - **Option 1 (Recommended)**: VPC endpoints for Systems Manager
+  - **Option 2**: NAT Gateway with route to internet (0.0.0.0/0)
+- ⚠️ Previous note: If using restrictive rules, the code block below is no longer needed:
     ```yaml
+    # NO LONGER NEEDED - Security group allows all HTTPS by default
     - IpProtocol: tcp
       FromPort: 443
       ToPort: 443
@@ -162,10 +170,23 @@ The NPA Publisher instances require outbound HTTPS (443) access to the following
 ### AWS Systems Manager Endpoints
 The security group must allow outbound traffic to AWS Systems Manager endpoints for SSM agent functionality. These endpoints are regional and automatically resolved via AWS DNS.
 
-### Netskope NewEdge Data Center IP Ranges
-To ensure reliable connectivity to Netskope NewEdge Data Centers and prevent service disruptions, allowlist the following IP ranges for outbound HTTPS (443) traffic.
+### Netskope IP Ranges
 
-**Reference**: [NewEdge IP Ranges for Allowlisting](https://docs.netskope.com/en/newedge-ip-ranges-for-allowlisting)
+⚠️ **TEMPORARY WORKAROUND**: The security group currently allows all outbound HTTPS (443) traffic (`0.0.0.0/0`).
+
+**Why?** Netskope NPA registration endpoints (`ns-*.{region}.npa.goskope.com`) are hosted on AWS infrastructure using **undocumented IP ranges** that are not included in Netskope's official documentation.
+
+**Known Issue:**
+- **Documented ranges** (from [NewEdge IP Ranges](https://docs.netskope.com/en/newedge-ip-ranges-for-allowlisting/)): `8.36.116.0/24`, `8.39.144.0/24`, `31.186.239.0/24`, `163.116.128.0/17`, `162.10.0.0/17`
+- **Discovered ranges** (not documented): `18.116.0.0/16` (us-east-2) - registration endpoint `ns-26784.us-dfw3.npa.goskope.com` resolves to `18.116.181.47`
+- **Missing**: Unknown IP ranges for registration endpoints in other AWS regions
+
+**Action Required:**
+1. Contact Netskope support to obtain the complete list of IP ranges for NPA registration endpoints across all regions
+2. Update the security group egress rules with specific IP ranges once obtained
+3. Remove the temporary `0.0.0.0/0` rule
+
+**Documented NewEdge IP Ranges** (for reference):
 
 | CIDR Block | IP Range | Description |
 |------------|----------|-------------|
@@ -175,7 +196,7 @@ To ensure reliable connectivity to Netskope NewEdge Data Centers and prevent ser
 | `163.116.128.0/17` | 163.116.128.0 – 163.116.255.255 | NewEdge DC |
 | `162.10.0.0/17` | 162.10.0.0 – 162.10.127.255 | NewEdge DC |
 
-**Note**: These IP ranges are used for both ingress and egress of NewEdge Data Centers. Publishers need outbound access to these ranges for registration and ongoing connectivity to Netskope infrastructure.
+**Note**: The documented ranges cover NewEdge data centers but do NOT include AWS-hosted NPA registration endpoints.
 
 ## How It Works
 
@@ -239,13 +260,15 @@ For deployment instructions, see:
 
 ```
 AWS-NPA-Ref-Architecture/
-├── README.md                              # This file - Architecture overview
+├── README.md                              # This file - Project overview
 ├── docs/
+│   ├── ARCHITECTURE.md                    # Detailed architecture overview and AWS best practices
 │   ├── QUICKSTART.md                      # Quick 10-minute deployment guide
 │   ├── DEPLOYMENT_GUIDE.md                # Complete deployment documentation
 │   ├── OPERATIONS.md                      # Operational procedures (replace publishers, updates, monitoring)
 │   ├── TROUBLESHOOTING.md                 # Common issues and solutions
 │   ├── DEVOPS-NOTES.md                    # Technical deep-dive (SSM, Lambda internals)
+│   ├── IAM-ROLE-SETUP.md                  # Guide for creating and assuming IAM roles for deployment
 │   └── images/
 │       └── npa_reference_architecture.png # Architecture diagram
 ├── scripts/
@@ -317,7 +340,7 @@ Approximate monthly costs for us-east-1 region:
 
 - ✅ **No secrets in user data** - Token passed via SSM only
 - ✅ **No public IPs** - Instance in private subnet
-- ✅ **Restrictive egress rules** - Only Netskope NewEdge IPs allowlisted (no 0.0.0.0/0)
+- ⚠️ **Egress rules** - Currently allows all HTTPS (0.0.0.0/0) as temporary workaround (see [Netskope IP Ranges](#netskope-ip-ranges))
 - ✅ **VPC endpoints for Systems Manager** - Private connectivity without internet routing
 - ✅ **IAM least privilege** - Minimal permissions
 - ✅ **Secrets Manager** - Encrypted token storage
@@ -370,13 +393,15 @@ Publisher Group Name: MyPublisher
 
 **Why this matters:** The Lambda function automatically assigns the publisher to apps matching this naming convention. Apps that don't follow this pattern will not be automatically associated with your publisher.
 
-**Note:** Apps can be created before or after deployment. During stack creation, the Lambda function automatically discovers and assigns the publisher to all existing apps matching the naming convention. If you create new apps after deployment, you'll need to either manually assign the publisher in the Netskope UI, or use the [PublisherReplacementTrigger parameter](docs/OPERATIONS.md#replace-publisher-in-specific-az) to force automatic re-assignment.
+**Note:** Apps can be created before or after deployment. During stack creation, the Lambda function automatically discovers and assigns the publisher to all existing apps matching the naming convention. If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI.
 
 ## Additional Resources
 
 ### Project Documentation
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed architecture overview and AWS best practices
 - **[QUICKSTART.md](docs/QUICKSTART.md)** - Quick 10-minute deployment guide
 - **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Complete deployment instructions
+- **[IAM-ROLE-SETUP.md](docs/IAM-ROLE-SETUP.md)** - Guide for creating and assuming IAM roles for deployment
 - **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures (replace publishers, AMI updates, monitoring)
 - **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions
 - **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive (SSM, Lambda internals)

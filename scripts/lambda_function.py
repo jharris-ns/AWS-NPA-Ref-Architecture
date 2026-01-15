@@ -168,6 +168,8 @@ def lambda_handler(event, context):
             return
 
         elif request_type == 'Update':
+            # UPDATE events are rare but can occur if CloudFormation properties change
+            # without triggering a replacement (e.g., tags or other non-critical properties)
             logger.info('Processing CloudFormation UPDATE event - no action needed')
             cfnresponse.send(event, context, cfnresponse.SUCCESS, {
                 'Message': 'Update completed (no changes required)'
@@ -501,6 +503,86 @@ def handle_create(publisher_name, publisher_group_name, EC2InstanceId, token):
 
 
 # ==============================================================
+# HELPER FUNCTION - Remove Publisher from Apps
+# ==============================================================
+
+def remove_publisher_from_apps(publisher_id, publisher_group_name, token):
+    """
+    Remove a publisher from all private applications matching the naming convention
+
+    Args:
+        publisher_id: Publisher ID to remove
+        publisher_group_name: Publisher group name for filtering apps
+        token: Netskope API token
+
+    Returns:
+        Number of apps updated
+    """
+    logger.info(f'Removing publisher {publisher_id} from private apps...')
+
+    api_url = '/api/v2/steering/apps/private'
+
+    try:
+        resp = call_netskope_api_with_retry('get', api_url, token, None)
+    except Exception as e:
+        logger.error(f'Error fetching private apps: {str(e)}')
+        raise
+
+    if resp['status'] != 'success':
+        logger.error('Got error while calling ' + api_url)
+        logger.error('Response: ' + json.dumps(resp))
+        raise Exception('Failed to fetch private applications')
+
+    private_apps = resp['data']['private_apps']
+    apps_updated = 0
+
+    for app in private_apps:
+        # Skip apps that don't match the naming convention
+        if app['app_name'].find(publisher_group_name) == -1:
+            continue
+
+        logger.info(f'Checking private app: {app["app_name"]}')
+
+        private_app_id = app['app_id']
+        api_url = '/api/v2/steering/apps/private/' + str(private_app_id)
+        service_publisher_assignments = app['service_publisher_assignments']
+
+        # Find and remove publisher
+        publisher_used = False
+        updated_assignments = []
+
+        for pub in service_publisher_assignments:
+            if pub['publisher_id'] == publisher_id:
+                logger.info(f'Removing publisher from app: {app["app_name"]}')
+                publisher_used = True
+            else:
+                updated_assignments.append(pub)
+
+        if not publisher_used:
+            logger.info(f'Publisher not in use by {app["app_name"]}')
+            continue
+
+        # Update app with publisher removed
+        payload = {'publishers': updated_assignments}
+
+        try:
+            resp = call_netskope_api_with_retry('patch', api_url, token, payload)
+        except Exception as e:
+            logger.error(f'Error updating app {app["app_name"]}: {str(e)}')
+            continue
+
+        if resp['status'] != 'success':
+            logger.error(f'Got error updating app {app["app_name"]}: ' + json.dumps(resp))
+            # Continue even if app update fails
+        else:
+            logger.info(f'Successfully removed publisher from app: {app["app_name"]}')
+            apps_updated += 1
+
+    logger.info(f'Removed publisher from {apps_updated} private applications')
+    return apps_updated
+
+
+# ==============================================================
 # DELETE HANDLER
 # ==============================================================
 
@@ -548,61 +630,12 @@ def handle_delete(publisher_name, publisher_group_name, token, instance_id=None)
             logger.warning(f'Could not stop EC2 instance: {str(e)}')
             logger.warning('Continuing with deletion anyway...')
 
-    # Remove publisher from all private apps
-    api_url = '/api/v2/steering/apps/private'
-
+    # Remove publisher from all private apps using helper function
     try:
-        resp = call_netskope_api_with_retry('get', api_url, token, None)
+        remove_publisher_from_apps(publisher_id, publisher_group_name, token)
     except Exception as e:
-        logger.error(f'Error fetching private apps: {str(e)}')
-        raise
-
-    if resp['status'] != 'success':
-        logger.error('Got error while calling ' + api_url)
-        logger.error('Response: ' + json.dumps(resp))
-        raise Exception('Failed to fetch private applications')
-
-    private_apps = resp['data']['private_apps']
-
-    for app in private_apps:
-        if app['app_name'].find(publisher_group_name) == -1:
-            continue
-
-        logger.info(f'Checking private app: {app["app_name"]}')
-
-        private_app_id = app['app_id']
-        api_url = '/api/v2/steering/apps/private/' + str(private_app_id)
-        service_publisher_assignments = app['service_publisher_assignments']
-
-        # Find and remove publisher
-        publisher_used = False
-        updated_assignments = []
-
-        for pub in service_publisher_assignments:
-            if pub['publisher_id'] == publisher_id:
-                logger.info(f'Removing publisher from app: {app["app_name"]}')
-                publisher_used = True
-            else:
-                updated_assignments.append(pub)
-
-        if not publisher_used:
-            logger.info(f'Publisher not in use by {app["app_name"]}')
-            continue
-
-        # Update app with publisher removed
-        payload = {'publishers': updated_assignments}
-
-        try:
-            resp = call_netskope_api_with_retry('patch', api_url, token, payload)
-        except Exception as e:
-            logger.error(f'Error updating app {app["app_name"]}: {str(e)}')
-            continue
-
-        if resp['status'] != 'success':
-            logger.error(f'Got error updating app {app["app_name"]}: ' + json.dumps(resp))
-            # Continue with deletion even if app update fails
-        else:
-            logger.info(f'Successfully removed publisher from app: {app["app_name"]}')
+        logger.warning(f'Error removing publisher from apps: {str(e)}')
+        logger.warning('Continuing with publisher deletion...')
 
     # Wait for publisher to disconnect BEFORE attempting deletion
     # The Netskope API will reject deletion if publisher is still connected
@@ -794,10 +827,33 @@ def wait_for_command_completion(ssm_client, command_id, instance_id, max_wait=30
 
             # Terminal states
             if status == 'Success':
-                logger.info('Command completed successfully')
+                logger.info('Command completed with Success status')
                 stdout = response.get('StandardOutputContent', '')
                 if stdout:
                     logger.info(f'Standard Output (first 500 chars): {stdout[:500]}')
+
+                    # Check if registration actually succeeded by parsing output
+                    # The npa_publisher_wizard command may return 0 exit code even on failure
+                    if 'Registration failed' in stdout or 'Error: Registration' in stdout:
+                        logger.error('Publisher registration failed despite command Success status')
+                        logger.error(f'Full output: {stdout}')
+                        return False
+
+                    # Additional failure patterns
+                    failure_patterns = [
+                        'context deadline exceeded',
+                        'Timeout exceeded',
+                        'admin call didn\'t succeed',
+                        'Please generate a new token'
+                    ]
+
+                    for pattern in failure_patterns:
+                        if pattern in stdout:
+                            logger.error(f'Registration failure detected: "{pattern}" found in output')
+                            logger.error(f'Full output: {stdout}')
+                            return False
+
+                    logger.info('Publisher registration command completed successfully')
                 return True
 
             elif status in ['Failed', 'Cancelled', 'TimedOut']:

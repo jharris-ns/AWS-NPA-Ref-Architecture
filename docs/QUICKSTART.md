@@ -356,7 +356,7 @@ Publisher Group Name: MyPublisher
 - Apps can be created before or after deployment - the initial deployment will assign publishers to all matching apps
 - On stack deletion, the Lambda function automatically removes the publisher from all associated apps
 
-**Note:** If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI, or use the [PublisherReplacementTrigger parameter](OPERATIONS.md#replace-publisher-in-specific-az) to force re-assignment.
+**Note:** If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI.
 
 ## Troubleshooting
 

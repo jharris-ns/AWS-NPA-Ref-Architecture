@@ -50,11 +50,6 @@ Metadata:
           - LambdaS3Key
       -
         Label:
-          default: "Operational parameters"
-        Parameters:
-          - PublisherReplacementTrigger
-      -
-        Label:
           default: "Cost allocation and tagging"
         Parameters:
           - CostCenterTag
@@ -91,8 +86,6 @@ Metadata:
         default: S3 bucket name for Lambda package (bucket name only, not s3:// URI)
       LambdaS3Key:
         default: S3 key/path for Lambda package (e.g., npa-publisher-lambda.zip)
-      PublisherReplacementTrigger:
-        default: Publisher replacement trigger (change value to force instance replacement)
 
 Parameters:
   NPAPublisherGroupName:
@@ -247,13 +240,6 @@ Parameters:
     Description: 'S3 key for Lambda deployment package (e.g., npa-publisher-lambda.zip or path/to/lambda.zip)'
     Type: String
     Default: 'npa-publisher-lambda.zip'
-
-  PublisherReplacementTrigger:
-    Description: 'Change this value to force replacement of publisher instances (increment number to trigger update)'
-    Type: String
-    Default: '1'
-    AllowedPattern: '^[0-9]+$'
-    ConstraintDescription: 'Must be a positive integer'
 
 Conditions:
   ToProvisionNewAPIToken: !Equals
@@ -810,32 +796,31 @@ Resources:
           - !Ref VPC
           - !Ref ExistingVPC
       SecurityGroupEgress:
-        # Netskope NewEdge Data Center IP Ranges
+        # =====================================================================
+        # TEMPORARY WORKAROUND: Allow all HTTPS egress
+        # =====================================================================
+        # ISSUE: Netskope NPA registration endpoints (ns-*.{region}.npa.goskope.com)
+        #        are hosted on AWS infrastructure using undocumented IP ranges.
+        #        Example: ns-26784.us-dfw3.npa.goskope.com -> 18.116.181.47
+        #
+        # DOCUMENTED RANGES (from https://docs.netskope.com/en/newedge-ip-ranges-for-allowlisting/):
+        #   - 8.36.116.0/24, 8.39.144.0/24, 31.186.239.0/24
+        #   - 163.116.128.0/17, 162.10.0.0/17
+        #
+        # DISCOVERED RANGES (not documented):
+        #   - 18.116.0.0/16 (us-east-2)
+        #   - Unknown ranges in other regions
+        #
+        # ACTION REQUIRED: Contact Netskope support to obtain complete IP range
+        #                  list for all NPA registration endpoints across all regions.
+        #
+        # TODO: Replace this rule with specific IP ranges once obtained from Netskope
+        # =====================================================================
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 8.36.116.0/24
-          Description: "Netskope NewEdge DC"
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 8.39.144.0/24
-          Description: "Netskope NewEdge DC"
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 31.186.239.0/24
-          Description: "Netskope NewEdge DC"
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 163.116.128.0/17
-          Description: "Netskope NewEdge DC"
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 162.10.0.0/17
-          Description: "Netskope NewEdge DC"
+          CidrIp: 0.0.0.0/0
+          Description: "TEMPORARY: Allow all HTTPS - pending complete Netskope IP ranges"
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-SecurityGroup'
@@ -981,7 +966,6 @@ Resources:
       InstanceId: !Ref NPAPublisherInstance
       PublisherGroupName: !Ref NPAPublisherGroupName
       AccountId: !Ref AWS::AccountId
-      ReplacementTrigger: !Ref PublisherReplacementTrigger
 
   NPAPublisherRegistration2:
     Type: Custom::NPAPublisher
@@ -991,7 +975,6 @@ Resources:
       InstanceId: !Ref NPAPublisherInstance2
       PublisherGroupName: !Ref NPAPublisherGroupName
       AccountId: !Ref AWS::AccountId
-      ReplacementTrigger: !Ref PublisherReplacementTrigger
 
 Outputs:
   PublisherInstanceId:

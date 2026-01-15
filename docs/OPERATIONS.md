@@ -4,7 +4,7 @@ Operational procedures for managing NPA Publisher deployments on AWS.
 
 ## Table of Contents
 
-- [Replace Publisher in Specific AZ](#replace-publisher-in-specific-az)
+- [Publisher Upgrades and Maintenance](#publisher-upgrades-and-maintenance)
 - [Update Publisher AMI Version](#update-publisher-ami-version)
 - [Scale Up/Down Instance Type](#scale-updown-instance-type)
 - [Rotate API Token](#rotate-api-token)
@@ -12,143 +12,87 @@ Operational procedures for managing NPA Publisher deployments on AWS.
 - [Backup and Restore](#backup-and-restore)
 - [Monitoring and Alerts](#monitoring-and-alerts)
 
-## Replace Publisher in Specific AZ
+## Publisher Upgrades and Maintenance
 
-Use this procedure when you need to replace a publisher instance in a specific availability zone (e.g., for maintenance, troubleshooting, or instance corruption).
+### Publisher Auto-Updates (Recommended)
 
-### Method 1: Using PublisherReplacementTrigger Parameter (Recommended)
+Netskope publishers support automatic upgrades managed through the Netskope console. This is the recommended method for keeping your publishers up-to-date with the latest features and security patches.
 
-This is the cleanest method as CloudFormation manages the entire lifecycle.
+**Configure auto-updates in Netskope UI:**
 
-**Step 1: Increment the PublisherReplacementTrigger parameter**
+1. Log in to your Netskope tenant
+2. Go to **Settings → Security Cloud Platform → Publishers**
+3. Select your publisher group
+4. Enable **Auto-Update** and configure the maintenance window
+5. Choose update schedule (e.g., weekly, monthly)
+
+**Benefits:**
+- No manual intervention required
+- Minimal downtime during updates
+- Automatic rollback on failure
+- Controlled maintenance windows
+- No infrastructure replacement needed
+
+**Documentation:**
+- [Configure Publisher Auto-Updates](https://docs.netskope.com/en/configure-publisher-auto-updates)
+
+### Manual Publisher Replacement
+
+If you need to replace a publisher instance for troubleshooting or to apply infrastructure changes (e.g., new AMI, different instance type), you can delete and recreate the stack or specific resources.
+
+**Important:** This approach replaces the EC2 infrastructure. For software updates only, use Netskope auto-updates instead.
+
+**Option 1: Replace via Stack Update (AMI or Instance Type Change)**
+
+Changing the AMI or instance type will trigger CloudFormation to replace the EC2 instances:
 
 ```bash
-# Get current parameter value
-CURRENT_TRIGGER=$(aws cloudformation describe-stacks \
-  --stack-name netskope-npa-publisher \
-  --query 'Stacks[0].Parameters[?ParameterKey==`PublisherReplacementTrigger`].ParameterValue' \
-  --output text)
+# Example: Update to new AMI
+NEW_AMI="ami-xxxxxxxxx"
 
-# Calculate new trigger value (increment by 1)
-NEW_TRIGGER=$((CURRENT_TRIGGER + 1))
-
-echo "Current trigger value: $CURRENT_TRIGGER"
-echo "New trigger value: $NEW_TRIGGER"
-
-# Update stack with new trigger value
 aws cloudformation update-stack \
   --stack-name netskope-npa-publisher \
   --use-previous-template \
   --parameters \
-    ParameterKey=PublisherReplacementTrigger,ParameterValue=$NEW_TRIGGER \
+    ParameterKey=NPAPublisherAMIId,ParameterValue=$NEW_AMI \
     ParameterKey=NetskopeTenantFQDN,UsePreviousValue=true \
-    ParameterKey=CreateNewVPC,UsePreviousValue=true \
-    ParameterKey=VPCCIDR,UsePreviousValue=true \
-    ParameterKey=PublicSubnetCIDR,UsePreviousValue=true \
-    ParameterKey=PrivateSubnetCIDR,UsePreviousValue=true \
-    ParameterKey=PublicSubnetCIDR2,UsePreviousValue=true \
-    ParameterKey=PrivateSubnetCIDR2,UsePreviousValue=true \
-    ParameterKey=AvailabilityZone,UsePreviousValue=true \
-    ParameterKey=AvailabilityZone2,UsePreviousValue=true \
-    ParameterKey=ExistingVPC,UsePreviousValue=true \
-    ParameterKey=ExistingPrivateSubnet,UsePreviousValue=true \
-    ParameterKey=ExistingPrivateSubnet2,UsePreviousValue=true \
     ParameterKey=NPAPublisherGroupName,UsePreviousValue=true \
-    ParameterKey=NPAPublisherAMIId,UsePreviousValue=true \
-    ParameterKey=NPAPublisherKey,UsePreviousValue=true \
-    ParameterKey=NPAPublisherInstanceType,UsePreviousValue=true \
-    ParameterKey=NetskopeAPIToken,UsePreviousValue=true \
-    ParameterKey=ProvisionNewAPIToken,UsePreviousValue=true \
-    ParameterKey=ExistingNetskopeAPITokenARN,UsePreviousValue=true \
-    ParameterKey=LambdaS3Bucket,UsePreviousValue=true \
-    ParameterKey=LambdaS3Key,UsePreviousValue=true \
-    ParameterKey=CostCenterTag,UsePreviousValue=true \
-    ParameterKey=ProjectTag,UsePreviousValue=true \
-    ParameterKey=EnvironmentTag,UsePreviousValue=true \
+    # ... (other parameters with UsePreviousValue=true)
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-**What happens:**
-1. CloudFormation detects the parameter change
-2. Custom resources are marked for replacement
-3. Lambda executes and deletes old publishers from Netskope
-4. New EC2 instances are created
-5. Lambda registers new publishers with Netskope
-6. Lambda updates private apps to use new publishers
-7. Old instances are terminated
+**Option 2: Terminate and Replace Individual Instance**
 
-**Step 2: Monitor the replacement**
+If you need to replace a single failing instance:
 
 ```bash
-# Watch stack events
+# Terminate the instance
+aws ec2 terminate-instances --instance-ids i-xxxxxxxxx
+
+# CloudFormation will automatically detect the termination and recreate the instance
+# Monitor stack events to track the replacement
 aws cloudformation describe-stack-events \
   --stack-name netskope-npa-publisher \
-  --max-items 20 \
-  --query 'StackEvents[*].[Timestamp,ResourceStatus,ResourceType,ResourceStatusReason]' \
-  --output table
-
-# Watch Lambda logs
-aws logs tail /aws/lambda/<PublisherGroupName>-RegistrationHandler --follow
+  --max-items 20
 ```
 
-**Step 3: Verify new publishers**
+**Option 3: Delete and Recreate Stack**
+
+For complete infrastructure refresh:
 
 ```bash
-# Check in Netskope UI
-# Settings → Security Cloud Platform → Publishers
-# You should see new publishers with updated instance IDs
+# Delete stack
+aws cloudformation delete-stack --stack-name netskope-npa-publisher
 
-# Or via API
-TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id NetskopeAPIToken-<PublisherGroupName> \
-  --query SecretString \
-  --output text | jq -r '.NetskopeAPIToken')
+# Wait for deletion to complete
+aws cloudformation wait stack-delete-complete --stack-name netskope-npa-publisher
 
-curl -H "Netskope-Api-Token: $TOKEN" \
-     https://mytenant.goskope.com/api/v2/infrastructure/publishers \
-     | jq '.data.publishers[] | {publisher_name, registered_hostname, status}'
-```
-
-### Method 2: Using AWS Console
-
-1. Go to AWS CloudFormation Console
-2. Select your stack: `netskope-npa-publisher`
-3. Click **Update**
-4. Choose **Use current template**
-5. Find **PublisherReplacementTrigger** parameter
-6. Change the value (e.g., from `1` to `2`)
-7. Click **Next** through remaining steps
-8. Check **I acknowledge that AWS CloudFormation might create IAM resources**
-9. Click **Update stack**
-10. Monitor the **Events** tab for progress
-
-### Replacement Timeline
-
-```
-t=0m    Stack update initiated
-        └─ Parameter change detected
-
-t=1m    Custom resources marked for replacement
-        └─ Lambda triggered for DELETE on old publishers
-
-t=2m    Old publishers deleted from Netskope
-        └─ Private apps unassigned from old publishers
-
-t=3m    New EC2 instances launched
-        └─ SSM Agent starts
-
-t=4m    Lambda triggered for CREATE on new publishers
-        └─ Publisher created in Netskope
-        └─ Registration token obtained
-
-t=5-7m  Lambda waits for SSM agent online
-        └─ Registration command sent
-
-t=8m    Publishers registered successfully
-        └─ Private apps updated
-
-t=9m    Old instances terminated
-        └─ Stack update complete ✅
+# Recreate stack using original parameters
+aws cloudformation create-stack \
+  --stack-name netskope-npa-publisher \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
+  --parameters file://deployment-parameters.json \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
 ## Update Publisher AMI Version
@@ -180,7 +124,6 @@ aws cloudformation update-stack \
     ParameterKey=NetskopeAPIToken,UsePreviousValue=true \
     ParameterKey=LambdaS3Bucket,UsePreviousValue=true \
     ParameterKey=LambdaS3Key,UsePreviousValue=true \
-    ParameterKey=PublisherReplacementTrigger,UsePreviousValue=true \
     # ... (other parameters with UsePreviousValue=true)
   --capabilities CAPABILITY_NAMED_IAM
 ```
