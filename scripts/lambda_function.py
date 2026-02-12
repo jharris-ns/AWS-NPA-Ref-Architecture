@@ -632,7 +632,16 @@ def handle_delete(publisher_name, publisher_group_name, token, instance_id=None)
 
     # Remove publisher from all private apps using helper function
     try:
-        remove_publisher_from_apps(publisher_id, publisher_group_name, token)
+        apps_updated = remove_publisher_from_apps(publisher_id, publisher_group_name, token)
+
+        # Wait for Netskope to propagate the app disassociation
+        # This is critical - the API has eventual consistency and may still report
+        # apps associated even after the PATCH succeeds
+        if apps_updated > 0:
+            logger.info('Waiting for app disassociation to propagate...')
+            apps_cleared = wait_for_publisher_apps_cleared(publisher_id, token, max_wait=60)
+            if not apps_cleared:
+                logger.warning('App disassociation may not have fully propagated - will retry deletion if needed')
     except Exception as e:
         logger.warning(f'Error removing publisher from apps: {str(e)}')
         logger.warning('Continuing with publisher deletion...')
@@ -648,18 +657,38 @@ def handle_delete(publisher_name, publisher_group_name, token, instance_id=None)
     else:
         logger.info(f'Publisher {publisher_name} successfully disconnected')
 
-    # Now delete publisher from Netskope
+    # Now delete publisher from Netskope with retry logic for eventual consistency
     api_url = '/api/v2/infrastructure/publishers/' + str(publisher_id)
+    max_delete_attempts = 5
+    delete_retry_interval = 5  # seconds between retries
 
-    try:
-        resp = call_netskope_api_with_retry('delete', api_url, token, None)
-    except Exception as e:
-        logger.error(f'Error deleting publisher: {str(e)}')
-        raise
+    for attempt in range(max_delete_attempts):
+        try:
+            resp = call_netskope_api_with_retry('delete', api_url, token, None)
+        except Exception as e:
+            logger.error(f'Error deleting publisher: {str(e)}')
+            raise
 
-    if resp['status'] != 'success':
-        logger.error('Got error while deleting publisher: ' + json.dumps(resp))
-        raise Exception('Failed to delete publisher')
+        if resp['status'] == 'success':
+            logger.info(f'Successfully completed deletion of publisher: {publisher_name}')
+            return
+
+        # Check if failure is due to app association (eventual consistency issue)
+        error_message = resp.get('message', '')
+        if 'associated with' in error_message and 'apps' in error_message:
+            if attempt < max_delete_attempts - 1:
+                logger.warning(f'Publisher still associated with apps (attempt {attempt + 1}/{max_delete_attempts})')
+                logger.info(f'Waiting {delete_retry_interval}s for eventual consistency...')
+                time.sleep(delete_retry_interval)
+                continue
+            else:
+                logger.error('Publisher deletion failed after all retries - still associated with apps')
+                logger.error('Got error while deleting publisher: ' + json.dumps(resp))
+                raise Exception('Failed to delete publisher - still associated with apps after retries')
+        else:
+            # Different error - fail immediately
+            logger.error('Got error while deleting publisher: ' + json.dumps(resp))
+            raise Exception('Failed to delete publisher')
 
     logger.info(f'Successfully completed deletion of publisher: {publisher_name}')
 
@@ -752,6 +781,57 @@ def wait_for_publisher_disconnected(publisher_id, token, max_wait=120):
             return True
 
     logger.warning(f'Timeout waiting for publisher to disconnect after {max_wait} seconds')
+    return False
+
+
+def wait_for_publisher_apps_cleared(publisher_id, token, max_wait=60):
+    """
+    Wait for publisher to have no associated apps after removal
+    Polls publisher status until apps_count is 0
+
+    Args:
+        publisher_id: Publisher ID to check
+        token: Netskope API token
+        max_wait: Maximum seconds to wait (default: 60)
+
+    Returns:
+        bool: True if apps cleared, False if timeout
+    """
+    logger.info(f'Waiting for publisher {publisher_id} app associations to clear...')
+
+    api_url = f'/api/v2/infrastructure/publishers/{publisher_id}'
+    elapsed = 0
+    wait_interval = 3  # Check every 3 seconds
+
+    while elapsed < max_wait:
+        try:
+            resp = call_netskope_api_with_retry('get', api_url, token, None, max_retries=2)
+
+            if resp['status'] == 'success' and 'data' in resp:
+                apps_count = resp['data'].get('apps_count', 0)
+                logger.info(f'Publisher apps_count: {apps_count} (elapsed: {elapsed}s)')
+
+                if apps_count == 0:
+                    logger.info(f'Publisher app associations cleared after {elapsed} seconds')
+                    return True
+
+                # Still has apps associated - keep waiting
+                logger.info(f'Publisher still has {apps_count} app(s) associated, waiting... ({elapsed}/{max_wait}s)')
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+
+            else:
+                # If we can't get publisher info, it may have been deleted
+                logger.info('Publisher not found - may have been deleted')
+                return True
+
+        except Exception as e:
+            logger.warning(f'Error checking publisher apps_count: {str(e)}')
+            # Continue trying
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+
+    logger.warning(f'Timeout waiting for publisher app associations to clear after {max_wait} seconds')
     return False
 
 

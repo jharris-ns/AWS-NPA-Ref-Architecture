@@ -198,6 +198,17 @@ The security group must allow outbound traffic to AWS Systems Manager endpoints 
 
 **Note**: The documented ranges cover NewEdge data centers but do NOT include AWS-hosted NPA registration endpoints.
 
+### RFC1918 Private Address Ranges
+
+The security group allows outbound traffic to all RFC1918 private address ranges to support **network segment discovery** for private applications. This enables the NPA Publisher to discover and communicate with private applications across your internal network segments.
+
+**Configured Ranges:**
+- `10.0.0.0/8` - Class A private addresses
+- `172.16.0.0/12` - Class B private addresses
+- `192.168.0.0/16` - Class C private addresses
+
+For more information on configuring network segment discovery, see [Netskope documentation: Configure App Discovery for Private Apps](https://docs.netskope.com/en/configure-app-discovery-for-private-apps).
+
 ## How It Works
 
 ### On Stack Creation (CREATE)
@@ -414,4 +425,4 @@ Publisher Group Name: MyPublisher
 
 ## License
 
-Apache License 2.0
+BSD 3-Clause License. See [LICENSE](LICENSE) for details.

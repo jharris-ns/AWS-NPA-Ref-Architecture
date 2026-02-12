@@ -17,7 +17,7 @@ Metadata:
         Parameters:
           - NetskopeTenantFQDN
           - ProvisionNewAPIToken
-          - ExistingNetskopeAPITokenARN
+          - ExistingNetskopeAPITokenParam
           - NetskopeAPIToken
       -
         Label:
@@ -42,6 +42,7 @@ Metadata:
           - NPAPublisherAMIId
           - NPAPublisherKey
           - NPAPublisherInstanceType
+          - EnableCWMonitoring
       -
         Label:
           default: "Lambda deployment configuration"
@@ -59,11 +60,11 @@ Metadata:
       NetskopeTenantFQDN:
         default: Netskope tenant FQDN, for example mytenant.goskope.com
       ProvisionNewAPIToken:
-        default: Choose if you'd like to create a new AWS Secrets Manager key for Netskope API token or to use the existing one
-      ExistingNetskopeAPITokenARN:
-        default: If you're using the existing AWS Secrets Manager secret for Netskope API token enter its ARN here
+        default: Choose if you'd like to create a new SSM Parameter Store parameter for Netskope API token or to use an existing one
+      ExistingNetskopeAPITokenParam:
+        default: If you're using an existing SSM Parameter Store parameter for Netskope API token enter its name here
       NetskopeAPIToken:
-        default: Netskope API v2 token if you're creating a new secret in AWS Secrets Manager
+        default: Netskope API v2 token if you're creating a new parameter in SSM Parameter Store
       VPC:
         default: VPC id where you'd like your NPA publisher to be deployed
       NPAPublisherSubnet:
@@ -82,6 +83,8 @@ Metadata:
         default: Project name for resource tracking and reporting
       EnvironmentTag:
         default: Environment type (Production, Staging, Development, Test)
+      EnableCWMonitoring:
+        default: Enable CloudWatch agent for memory and disk metrics (~$2.40/month per instance)
       LambdaS3Bucket:
         default: S3 bucket name for Lambda package (bucket name only, not s3:// URI)
       LambdaS3Key:
@@ -113,7 +116,7 @@ Parameters:
       - 'no'
 
   VPCCIDR:
-    Description: 'CIDR block for new VPC (only used if CreateNewVPC=yes)'
+    Description: 'CIDR block for VPC. Used when creating new VPC, or specify existing VPC CIDR for security group rules.'
     Type: String
     Default: '10.0.0.0/16'
     AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
@@ -188,7 +191,7 @@ Parameters:
 
   ProvisionNewAPIToken:
     Default: 'yes'
-    Description: 'Provision new Netskope API v2 token in AWS Secrets Manager?'
+    Description: 'Provision new Netskope API v2 token in SSM Parameter Store?'
     AllowedValues:
       - 'yes'
       - 'no'
@@ -197,15 +200,13 @@ Parameters:
   NetskopeAPIToken:
     NoEcho: true
     Default: ""
-    Description: 'If new Netskope API v2 token has to be provisioned in AWS Secrets Manager, enter it here'
+    Description: 'If new Netskope API v2 token has to be provisioned in SSM Parameter Store, enter it here'
     Type: String
 
-  ExistingNetskopeAPITokenARN:
-    Description: 'If an existing Netskope API v2 token in AWS Secrets Manager will be used, enter the secret ARN here'
+  ExistingNetskopeAPITokenParam:
+    Description: 'If an existing SSM parameter for Netskope API v2 token will be used, enter the parameter name here (e.g., /netskope/api-token). For production, use a SecureString parameter created via CLI.'
     Type: 'String'
-    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[a-zA-Z0-9/_+=.@-]+)?$'
-    ConstraintDescription: 'Must be a valid AWS Secrets Manager secret ARN or empty'
-    Default: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:placeholder'
+    Default: ''
 
   CostCenterTag:
     Description: 'Cost center for resource allocation and billing'
@@ -230,6 +231,14 @@ Parameters:
       - 'Staging'
       - 'Development'
       - 'Test'
+
+  EnableCWMonitoring:
+    Description: 'Install CloudWatch agent for advanced metrics (memory, disk usage). Adds ~$2.40/month per instance for custom metrics.'
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'yes'
+      - 'no'
 
   LambdaS3Bucket:
     Description: 'S3 bucket name containing Lambda deployment package (bucket name only, not s3:// URI). Leave empty to use default Netskope bucket'
@@ -263,6 +272,9 @@ Conditions:
     - !Equals
       - !Ref AvailabilityZone2
       - ''
+  EnableCloudWatchMonitoring: !Equals
+    - !Ref EnableCWMonitoring
+    - 'yes'
 
 Mappings:
   SourceCode:
@@ -564,23 +576,83 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable2
 
   # ==============================================================
-  # Secrets Manager
+  # SSM Parameter Store (API Token)
   # ==============================================================
-  APISecret:
-    Type: 'AWS::SecretsManager::Secret'
+  # NOTE: CloudFormation does not support creating SecureString parameters.
+  # This creates a String parameter. For production, pre-create the parameter
+  # as SecureString via CLI and use ProvisionNewAPIToken=no:
+  #   aws ssm put-parameter --name /netskope/api-token --type SecureString --value "YOUR_TOKEN"
+  APITokenParameter:
+    Type: 'AWS::SSM::Parameter'
     Condition: ToProvisionNewAPIToken
     Properties:
-      Description: Netskope API secret token V2
-      SecretString: !Sub '{"token":"${NetskopeAPIToken}"}'
+      Name: !Sub '${AWS::StackName}-netskope-api-token'
+      Type: String
+      Description: Netskope API v2 token
+      Value: !Ref NetskopeAPIToken
       Tags:
-        - Key: Name
-          Value: NetskopeAPIToken
-        - Key: CostCenter
-          Value: !Ref CostCenterTag
-        - Key: Project
-          Value: !Ref ProjectTag
-        - Key: Environment
-          Value: !Ref EnvironmentTag
+        CostCenter: !Ref CostCenterTag
+        Project: !Ref ProjectTag
+        Environment: !Ref EnvironmentTag
+
+  # ==============================================================
+  # CloudWatch Agent Configuration
+  # ==============================================================
+  CloudWatchAgentConfig:
+    Type: AWS::SSM::Parameter
+    Condition: EnableCloudWatchMonitoring
+    Properties:
+      Name: !Sub '/cloudwatch-config/${AWS::StackName}/${NPAPublisherGroupName}'
+      Type: String
+      Description: CloudWatch agent configuration for NPA Publisher monitoring
+      Value: !Sub |
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "run_as_user": "cwagent"
+          },
+          "metrics": {
+            "namespace": "NPA/Publisher",
+            "append_dimensions": {
+              "InstanceId": "${!aws:InstanceId}",
+              "PublisherGroup": "${NPAPublisherGroupName}"
+            },
+            "metrics_collected": {
+              "cpu": {
+                "measurement": [
+                  {"name": "cpu_usage_idle", "rename": "CPU_IDLE", "unit": "Percent"},
+                  {"name": "cpu_usage_iowait", "rename": "CPU_IOWAIT", "unit": "Percent"}
+                ],
+                "metrics_collection_interval": 60,
+                "resources": ["*"],
+                "totalcpu": false
+              },
+              "disk": {
+                "measurement": [
+                  {"name": "used_percent", "rename": "DISK_USED", "unit": "Percent"}
+                ],
+                "metrics_collection_interval": 60,
+                "resources": ["*"]
+              },
+              "mem": {
+                "measurement": [
+                  {"name": "mem_used_percent", "rename": "MEMORY_USED", "unit": "Percent"}
+                ],
+                "metrics_collection_interval": 60
+              },
+              "swap": {
+                "measurement": [
+                  {"name": "swap_used_percent", "rename": "SWAP_USED", "unit": "Percent"}
+                ],
+                "metrics_collection_interval": 60
+              }
+            }
+          }
+        }
+      Tags:
+        CostCenter: !Ref CostCenterTag
+        Project: !Ref ProjectTag
+        Environment: !Ref EnvironmentTag
 
   # ==============================================================
   # IAM Roles
@@ -588,7 +660,7 @@ Resources:
   NPAPublisherInstanceRole:
     Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: !Sub '${NPAPublisherGroupName}-InstanceRole-${AWS::Region}'
+      RoleName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-InstanceRole-${AWS::Region}'
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-InstanceRole'
@@ -609,19 +681,36 @@ Resources:
       Path: '/'
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - !If
+          - EnableCloudWatchMonitoring
+          - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+          - !Ref AWS::NoValue
+      Policies:
+        - !If
+          - EnableCloudWatchMonitoring
+          - PolicyName: CloudWatchAgentConfig
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: CloudWatchAgentSSMParameter
+                  Effect: Allow
+                  Action:
+                    - 'ssm:GetParameter'
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cloudwatch-config/${AWS::StackName}/${NPAPublisherGroupName}'
+          - !Ref AWS::NoValue
 
   NPAPublisherInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Path: "/"
-      InstanceProfileName: !Sub '${NPAPublisherGroupName}-InstanceProfile-${AWS::Region}'
+      InstanceProfileName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-InstanceProfile-${AWS::Region}'
       Roles:
         - !Ref NPAPublisherInstanceRole
 
   NPACallNetskopeAPIv2LFRole:
     Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: !Sub '${NPAPublisherGroupName}-LFRole-${AWS::Region}'
+      RoleName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-LFRole-${AWS::Region}'
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-LFRole'
@@ -641,7 +730,7 @@ Resources:
               - sts:AssumeRole
       Path: '/'
       Policies:
-        - PolicyName: !Sub '${NPAPublisherGroupName}-LFPolicy-${AWS::Region}'
+        - PolicyName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-LFPolicy-${AWS::Region}'
           PolicyDocument:
             Statement:
               - Sid: CloudWatchLogs
@@ -651,7 +740,7 @@ Resources:
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NPAPublisherGroupName}-RegistrationHandler:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${NPAPublisherGroupName}-RegistrationHandler:*'
               - Sid: SecretsManagerAccess
                 Effect: Allow
                 Action:
@@ -721,7 +810,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Condition: CreateVPC
     Properties:
-      GroupName: !Sub '${NPAPublisherGroupName}-VPCEndpoint-SecurityGroup'
+      GroupName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-VPCEndpoint-SecurityGroup'
       GroupDescription: "Security group for Systems Manager VPC endpoints"
       VpcId: !Ref VPC
       SecurityGroupIngress:
@@ -788,7 +877,7 @@ Resources:
   NPAPublisherSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Sub '${NPAPublisherGroupName}-SecurityGroup'
+      GroupName: !Sub '${AWS::StackName}-${NPAPublisherGroupName}-SecurityGroup'
       GroupDescription: "Security group with restrictive egress rules for Netskope and Systems Manager"
       VpcId:
         Fn::If:
@@ -796,6 +885,52 @@ Resources:
           - !Ref VPC
           - !Ref ExistingVPC
       SecurityGroupEgress:
+        # Allow all traffic within VPC (for private app connectivity)
+        - IpProtocol: -1
+          CidrIp: !Ref VPCCIDR
+          Description: "Allow all traffic within VPC for private app access"
+        # RFC1918 Private Address Ranges (for network segment discovery)
+        # See: https://docs.netskope.com/en/configure-app-discovery-for-private-apps
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/8
+          Description: "RFC1918 Class A - Network segment discovery"
+        - IpProtocol: -1
+          CidrIp: 172.16.0.0/12
+          Description: "RFC1918 Class B - Network segment discovery"
+        - IpProtocol: -1
+          CidrIp: 192.168.0.0/16
+          Description: "RFC1918 Class C - Network segment discovery"
+        # Netskope NewEdge Data Center IP Ranges
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 8.36.116.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 8.39.144.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 31.186.239.0/24
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 163.116.128.0/17
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 162.10.0.0/17
+          Description: "Netskope NewEdge DC"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 18.116.0.0/16
+          Description: "Netskope Registration endpoints us-east-2"
         # =====================================================================
         # TEMPORARY WORKAROUND: Allow all HTTPS egress
         # =====================================================================
@@ -861,6 +996,31 @@ Resources:
           - !Ref PrivateSubnet
           - !Ref ExistingPrivateSubnet
       Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        !If
+          - EnableCloudWatchMonitoring
+          - Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Install CloudWatch agent
+              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+              dpkg -i -E ./amazon-cloudwatch-agent.deb
+              rm amazon-cloudwatch-agent.deb
+
+              # Fetch configuration from SSM Parameter and start agent
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config \
+                -m ec2 \
+                -s \
+                -c ssm:${CloudWatchAgentConfig}
+
+              echo "CloudWatch agent installed and configured"
+          - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: !Ref NPAPublisherGroupName
@@ -888,6 +1048,31 @@ Resources:
           - !Ref PrivateSubnet2
           - !Ref ExistingPrivateSubnet2
       Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        !If
+          - EnableCloudWatchMonitoring
+          - Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Install CloudWatch agent
+              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+              dpkg -i -E ./amazon-cloudwatch-agent.deb
+              rm amazon-cloudwatch-agent.deb
+
+              # Fetch configuration from SSM Parameter and start agent
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config \
+                -m ec2 \
+                -s \
+                -c ssm:${CloudWatchAgentConfig}
+
+              echo "CloudWatch agent installed and configured"
+          - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-2'
@@ -915,7 +1100,7 @@ Resources:
           - id: W58
             reason: "Function has CloudWatch Logs permissions in IAM role"
     Properties:
-      FunctionName: !Sub "${NPAPublisherGroupName}-RegistrationHandler"
+      FunctionName: !Sub "${AWS::StackName}-${NPAPublisherGroupName}-RegistrationHandler"
       Description: >-
         CloudFormation custom resource handler for NPA publisher registration via SSM
       Handler: 'lambda_function.lambda_handler'
