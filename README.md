@@ -41,7 +41,7 @@ The deployment requires permissions for the following AWS services:
 | **VPC Endpoints** | Create/manage interface endpoints | Private Systems Manager connectivity |
 | **IAM** | Create/manage roles and instance profiles | Lambda execution and EC2 instance roles |
 | **Lambda** | Create/invoke functions | Publisher registration automation |
-| **Secrets Manager** | Create/manage secrets | Secure API token storage |
+| **SSM Parameter Store** | Create/manage parameters | Secure API token storage |
 | **S3** | Read objects | Lambda deployment package access |
 | **Systems Manager** | Send commands, describe instances | Publisher registration via SSM |
 | **CloudWatch Logs** | Create log groups/streams | Lambda function logging |
@@ -78,7 +78,7 @@ Provide the **[templates/deployment-iam-policy.json](templates/deployment-iam-po
 
 The provided policy follows AWS least privilege best practices:
 - IAM role permissions are scoped to resources with `NPAPublisher` or `RegistrationHandler` in the name
-- Secrets Manager access is limited to secrets with `NetskopeAPIToken-` prefix
+- SSM Parameter Store access is limited to the stack's API token parameter
 - Lambda and CloudWatch Logs permissions are scoped to the registration handler function
 - No `*:*` permissions are granted
 
@@ -147,13 +147,15 @@ ExistingPrivateSubnet2: subnet-yyyyy # Second AZ (optional but recommended)
 ```
 CloudFormation Stack
     │
+    ├─ SSM Parameter (stores Netskope API token)
+    │
     ├─ EC2 Instance (with SSM Agent)
     │
     ├─ Custom Resource (triggers on CREATE/DELETE)
     │      │
     │      └─ Lambda Function
     │             │
-    │             ├─ Retrieves API token from Secrets Manager
+    │             ├─ Reads API token from SSM Parameter Store
     │             ├─ Calls Netskope API to create publisher & get registration token
     │             ├─ Waits for instance to be running
     │             ├─ Waits for SSM Agent to be online
@@ -305,7 +307,7 @@ The Lambda function (`scripts/lambda_function.py`) handles publisher lifecycle:
 - `wait_for_instance_running()` - EC2 state polling with timeout
 - `wait_for_command_completion()` - SSM command status monitoring
 - `call_netskope_api()` - Netskope REST API v2 wrapper
-- `get_secret()` - Secrets Manager integration
+- `get_secret()` - SSM Parameter Store integration
 
 ### Automatic Application Management
 
@@ -338,7 +340,7 @@ Approximate monthly costs for us-east-1 region:
 | NAT Gateway x2 (if created) | ~$64 + data transfer |
 | VPC Endpoints x3 (ssm, ec2messages, ssmmessages, 2 AZs) | ~$44 |
 | Lambda executions | < $1 |
-| Secrets Manager | $0.40 |
+| SSM Parameter Store | Free |
 | **Total (new VPC, multi-AZ)** | **~$229/month** |
 | **Total (existing VPC, multi-AZ)** | **~$121/month** |
 | **Total (single AZ)** | **~$95/month** |
@@ -354,7 +356,7 @@ Approximate monthly costs for us-east-1 region:
 - ⚠️ **Egress rules** - Currently allows all HTTPS (0.0.0.0/0) as temporary workaround (see [Netskope IP Ranges](#netskope-ip-ranges))
 - ✅ **VPC endpoints for Systems Manager** - Private connectivity without internet routing
 - ✅ **IAM least privilege** - Minimal permissions
-- ✅ **Secrets Manager** - Encrypted token storage
+- ✅ **SSM Parameter Store** - Secure token storage (supports SecureString encryption)
 - ✅ **SSM Session Manager** - No SSH keys needed
 - ✅ **No inbound rules** - Publishers only initiate outbound connections
 

@@ -9,6 +9,8 @@ Operational procedures for managing NPA Publisher deployments on AWS.
 - [Scale Up/Down Instance Type](#scale-updown-instance-type)
 - [Rotate API Token](#rotate-api-token)
 - [Manual Publisher Registration](#manual-publisher-registration)
+- [Scale Publisher Count](#scale-publisher-count)
+- [Publisher Deletion Workflow](#publisher-deletion-workflow)
 - [Backup and Restore](#backup-and-restore)
 - [Monitoring and Alerts](#monitoring-and-alerts)
 
@@ -159,46 +161,164 @@ aws cloudformation update-stack \
 
 **Impact**: Both instances will be replaced with new instance type. Minimal downtime as replacement happens one at a time in multi-AZ deployments.
 
+## Scale Publisher Count
+
+The CloudFormation template is designed for copy-paste scaling. Each publisher requires two resources: an EC2 Instance and a Custom Resource (registration). Keep at least 2 publishers for high availability.
+
+### Scale Out (Add a Publisher)
+
+1. Open `templates/netskope-ref-architecture-npa.yaml`
+2. Copy an entire "Publisher 2" block (both `NPAPublisherInstance2` and `NPAPublisherRegistration2`)
+3. Rename the resources by incrementing the suffix number:
+   - `NPAPublisherInstance2` -> `NPAPublisherInstance3`
+   - `NPAPublisherRegistration2` -> `NPAPublisherRegistration3`
+4. Update `DependsOn` in the Registration resource to include **both** the new Instance name **and** the previous Registration:
+   ```yaml
+   NPAPublisherRegistration3:
+     Type: Custom::NPAPublisher
+     DependsOn:
+       - NPAPublisherInstance3
+       - NPAPublisherRegistration2   # Serializes registration to avoid race conditions
+   ```
+   **Important:** Registrations must run sequentially because each one reads and writes the same private app definitions via the Netskope API. Without the `DependsOn` chain, concurrent registrations cause a read-modify-write race condition where one publisher's app assignment overwrites another's.
+5. Set `SubnetId` to the desired subnet:
+   - **New VPC:** `!Ref PrivateSubnet` or `!Ref PrivateSubnet2`
+   - **Existing VPC:** `!Ref ExistingPrivateSubnet` or `!Ref ExistingPrivateSubnet2`
+   - For a third AZ, add a new subnet parameter and reference it here
+6. Update the `Name` tag to a unique value (e.g., `${NPAPublisherGroupName}-3`)
+7. Add matching Outputs at the bottom of the template:
+   ```yaml
+   PublisherInstanceId3:
+     Description: EC2 Instance ID of NPA Publisher 3
+     Value: !Ref NPAPublisherInstance3
+     Export:
+       Name: !Sub '${AWS::StackName}-InstanceId3'
+
+   PublisherPrivateIP3:
+     Description: Private IP address of NPA Publisher 3
+     Value: !GetAtt NPAPublisherInstance3.PrivateIp
+     Export:
+       Name: !Sub '${AWS::StackName}-PrivateIP3'
+   ```
+8. Deploy the updated template:
+
+```bash
+aws cloudformation update-stack \
+  --stack-name netskope-npa-publisher \
+  --template-body file://templates/netskope-ref-architecture-npa.yaml \
+  --parameters \
+    ParameterKey=NetskopeTenantFQDN,UsePreviousValue=true \
+    ParameterKey=NPAPublisherGroupName,UsePreviousValue=true \
+    ParameterKey=NPAPublisherAMIId,UsePreviousValue=true \
+    ParameterKey=NPAPublisherKey,UsePreviousValue=true \
+    ParameterKey=NPAPublisherInstanceType,UsePreviousValue=true \
+    ParameterKey=LambdaS3Bucket,UsePreviousValue=true \
+    ParameterKey=LambdaS3Key,UsePreviousValue=true \
+    # ... (other parameters with UsePreviousValue=true)
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+### Scale In (Remove a Publisher)
+
+1. Delete the publisher's Instance + Registration resource block from the template
+2. Update the `DependsOn` chain: if you remove a publisher in the middle of the chain (e.g., Publisher 2 of 3), update Publisher 3's Registration `DependsOn` to point to the previous Registration in the chain
+3. Delete the matching Outputs entries
+4. Deploy the updated template using the same `aws cloudformation update-stack` command above
+
+CloudFormation triggers the Custom Resource DELETE event, which automatically:
+- Stops the EC2 instance to force disconnection
+- Removes the publisher from all associated private app definitions
+- Waits for the publisher to disconnect
+- Deletes the publisher from Netskope (retries with re-removal from apps to handle eventual consistency)
+
+No manual cleanup in Netskope is required. See [Publisher Deletion Workflow](#publisher-deletion-workflow) for details on what happens during deletion, and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#timeout-reference) if timeouts occur.
+
+## Publisher Deletion Workflow
+
+When CloudFormation processes a DELETE for a publisher Custom Resource (either during scale-in or full stack deletion), the Lambda function performs the following sequence:
+
+### Automated Delete Flow
+
+1. **Find publisher by name** -- GET all publishers, match by `publisher_name`
+2. **Stop EC2 instance** -- Non-blocking, best-effort `ec2:StopInstances` call to force publisher disconnection
+3. **Remove publisher from all app definitions** -- GET all private apps, filter for apps using this publisher, PATCH each app to remove the publisher from its `service_publisher_assignments`
+4. **Wait for publisher to disconnect** -- Poll publisher status every 5s until not "connected" (max `PUBLISHER_DISCONNECT_TIMEOUT`, default 120s)
+5. **Delete publisher with retry** -- DELETE the publisher, retrying up to 8 times at 10s intervals. On each retry, the Lambda re-removes the publisher from apps (re-PATCHes) to handle the Netskope API's eventual consistency
+
+### Why This Order Matters
+
+The Netskope API rejects publisher deletion if the publisher is still associated with private apps. The Lambda removes all app associations before attempting deletion. However, the Netskope API has eventual consistency — reads may still report associations even after a successful PATCH. To handle this, the delete retry loop re-PATCHes apps on each attempt, which is especially important when multiple publishers are being deleted concurrently (e.g., during full stack deletion) and one PATCH can overwrite another's changes.
+
+### Verifying Deletion
+
+Check that the publisher was removed from Netskope:
+
+```bash
+# Via API
+STACK_NAME="netskope-npa-publisher"
+TOKEN=$(aws ssm get-parameter \
+  --name "${STACK_NAME}-netskope-api-token" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text)
+
+curl -H "Netskope-Api-Token: $TOKEN" \
+     https://mytenant.goskope.com/api/v2/infrastructure/publishers \
+     | jq '.data.publishers[] | select(.publisher_name | contains("<PublisherGroupName>"))'
+```
+
+Or check the Netskope UI under **Settings > Security Cloud Platform > Publishers**.
+
+### Manual Cleanup (if Automated Deletion Fails)
+
+If the Lambda times out or encounters an error during deletion:
+
+1. **Remove from apps manually** -- In Netskope UI, go to each private app using the publisher and remove the publisher assignment
+2. **Wait for disconnection** -- The publisher should disconnect after the EC2 instance stops (CloudFormation terminates it during stack deletion)
+3. **Delete publisher** -- In Netskope UI under Publishers, select the orphaned publisher and delete it
+
+See [DEVOPS-NOTES.md](DEVOPS-NOTES.md#timer--polling-architecture) for internal timer details and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#timeout-reference) for timeout tuning.
+
 ## Rotate API Token
 
-Rotate the Netskope API token stored in Secrets Manager.
+Rotate the Netskope API token stored in SSM Parameter Store.
 
 ### Step 1: Generate new token in Netskope UI
 
 1. Log in to Netskope tenant
-2. Go to **Settings → Tools → REST API v2**
-3. Click **New Token**
+2. Go to **Settings → Administration → Administrators & Roles**
+3. Create a new service account (or edit an existing one) with a REST API v2 token
 4. Name: `NPA-Publisher-Rotated-<Date>`
-5. Select scopes: **Infrastructure Management**, **Private Applications**
+5. Assign scopes: **Infrastructure Management**, **Private Applications**
 6. Copy the token
 
-### Step 2: Update Secrets Manager
+> **Note:** Netskope now requires admin service accounts for new REST API v2 tokens. The legacy **Settings → Tools → REST API v2** page can still manage previously created tokens but cannot create new ones. See [Netskope Service Accounts documentation](https://docs.netskope.com/en/netskope-help/admin/administration/service-accounts/) for details.
+
+### Step 2: Update SSM Parameter
 
 ```bash
-# Get secret name
-SECRET_NAME=$(aws cloudformation describe-stacks \
-  --stack-name netskope-npa-publisher \
-  --query 'Stacks[0].Parameters[?ParameterKey==`NPAPublisherGroupName`].ParameterValue' \
-  --output text)
+STACK_NAME="netskope-npa-publisher"
+PARAM_NAME="${STACK_NAME}-netskope-api-token"
 
-SECRET_NAME="NetskopeAPIToken-${SECRET_NAME}"
-
-# Update secret with new token
+# Update parameter with new token
 NEW_TOKEN="your-new-api-token-here"
 
-aws secretsmanager update-secret \
-  --secret-id $SECRET_NAME \
-  --secret-string "{\"NetskopeAPIToken\":\"$NEW_TOKEN\"}"
+aws ssm put-parameter \
+  --name $PARAM_NAME \
+  --value "$NEW_TOKEN" \
+  --type SecureString \
+  --overwrite
 ```
 
 ### Step 3: Test token
 
 ```bash
 # Verify token works
-TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id $SECRET_NAME \
-  --query SecretString \
-  --output text | jq -r '.NetskopeAPIToken')
+TOKEN=$(aws ssm get-parameter \
+  --name $PARAM_NAME \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text)
 
 curl -H "Netskope-Api-Token: $TOKEN" \
      https://mytenant.goskope.com/api/v2/infrastructure/publishers
@@ -208,9 +328,9 @@ curl -H "Netskope-Api-Token: $TOKEN" \
 
 ### Step 4: Revoke old token (optional)
 
-1. Go to **Settings → Tools → REST API v2** in Netskope UI
-2. Find the old token
-3. Click **Revoke**
+1. Go to **Settings → Administration → Administrators & Roles** in Netskope UI (or **Settings → Tools → REST API v2** for legacy tokens)
+2. Find the old token or service account
+3. Revoke or delete it
 
 ## Manual Publisher Registration
 
@@ -220,10 +340,12 @@ Manually register a publisher if automatic registration failed.
 
 ```bash
 # Get API token
-TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id NetskopeAPIToken-<PublisherGroupName> \
-  --query SecretString \
-  --output text | jq -r '.NetskopeAPIToken')
+STACK_NAME="netskope-npa-publisher"
+TOKEN=$(aws ssm get-parameter \
+  --name "${STACK_NAME}-netskope-api-token" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text)
 
 # Get instance ID
 INSTANCE_ID=$(aws cloudformation describe-stacks \
@@ -298,9 +420,11 @@ aws cloudformation get-template \
   --query TemplateBody \
   --output text > template-backup-$(date +%Y%m%d).yaml
 
-# Export secrets (secure location!)
-aws secretsmanager get-secret-value \
-  --secret-id NetskopeAPIToken-<PublisherGroupName> \
+# Export API token (secure location!)
+STACK_NAME="netskope-npa-publisher"
+aws ssm get-parameter \
+  --name "${STACK_NAME}-netskope-api-token" \
+  --with-decryption \
   --output json > secrets-backup-$(date +%Y%m%d).json
 ```
 
@@ -422,6 +546,6 @@ aws cloudwatch put-dashboard \
 ## Additional Resources
 
 - [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) - Deployment instructions
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Common issues and solutions
-- [DEVOPS-NOTES.md](DEVOPS-NOTES.md) - Technical deep-dive
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Common issues, solutions, and timeout tuning
+- [DEVOPS-NOTES.md](DEVOPS-NOTES.md) - Technical deep-dive (timer architecture, polling internals)
 - [Netskope REST API v2](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)

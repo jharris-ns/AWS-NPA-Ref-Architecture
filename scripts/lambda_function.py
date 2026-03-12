@@ -1,264 +1,251 @@
-import boto3
-from datetime import datetime, timezone
+"""NPA Publisher registration with Netskope via CloudFormation Custom Resources."""
+
+# pylint: disable=broad-exception-caught,too-many-branches,too-many-statements
+# pylint: disable=too-many-locals,too-many-lines
+
+import copy
 import json
-import requests
+import logging
 import os
-from botocore.exceptions import ClientError
 import time
-import urllib3
+import urllib.error
+import urllib.request
+
+import boto3
 import cfnresponse
+from botocore.exceptions import ClientError
 
-# Disable SSL warnings for development (remove in production)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Configuration from environment variables
-AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
-tenant_fqdn = os.environ['tenant_fqdn']
-secret_name = os.environ['api_token']
-LOGLEVEL = os.getenv('LOGLEVEL', 'INFO')
+# Configuration from environment variables (use getenv to avoid crash at import time)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+tenant_fqdn = os.getenv("tenant_fqdn", "")
+secret_name = os.getenv("api_token", "")
+LOGLEVEL = os.getenv("LOGLEVEL", "INFO")
 
 # Configurable timeouts
-EC2_READY_TIMEOUT = int(os.getenv('EC2_READY_TIMEOUT', '120'))
-SSM_READY_TIMEOUT = int(os.getenv('SSM_READY_TIMEOUT', '240'))
-COMMAND_TIMEOUT = int(os.getenv('COMMAND_TIMEOUT', '300'))
-PUBLISHER_DISCONNECT_TIMEOUT = int(os.getenv('PUBLISHER_DISCONNECT_TIMEOUT', '120'))
+EC2_READY_TIMEOUT = int(os.getenv("EC2_READY_TIMEOUT", "120"))
+SSM_READY_TIMEOUT = int(os.getenv("SSM_READY_TIMEOUT", "240"))
+COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "300"))
+PUBLISHER_DISCONNECT_TIMEOUT = int(os.getenv("PUBLISHER_DISCONNECT_TIMEOUT", "120"))
+
+# Module-level boto3 clients (reused across warm invocations)
+ec2_client = boto3.client("ec2", region_name=AWS_REGION)
+ssm_client = boto3.client("ssm", region_name=AWS_REGION)
+
+# Logging
+logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, LOGLEVEL, logging.INFO))
 
 
 # ==============================================================
-# CUSTOM EXCEPTIONS WITH TROUBLESHOOTING
+# CUSTOM EXCEPTIONS
 # ==============================================================
+
 
 class PublisherRegistrationError(Exception):
-    """Base exception for publisher registration errors with troubleshooting guidance"""
-    def __init__(self, phase, details, troubleshooting=None):
+    """Base exception for publisher registration errors."""
+
+    def __init__(self, phase, details):
         self.phase = phase
         self.details = details
-        self.troubleshooting = troubleshooting or self._get_default_troubleshooting()
         super().__init__(f"{phase}: {details}")
-
-    def _get_default_troubleshooting(self):
-        return ["Check CloudWatch logs for more details"]
-
-    def format_error(self):
-        """Format error with troubleshooting steps"""
-        msg = f"\n{'='*60}\n"
-        msg += f"ERROR PHASE: {self.phase}\n"
-        msg += f"DETAILS: {self.details}\n"
-        msg += f"\nTROUBLESHOOTING STEPS:\n"
-        for i, step in enumerate(self.troubleshooting, 1):
-            msg += f"  {i}. {step}\n"
-        msg += f"{'='*60}\n"
-        return msg
 
 
 class SSMError(PublisherRegistrationError):
-    """SSM-related errors"""
-    def _get_default_troubleshooting(self):
-        return [
-            "Check security group allows HTTPS (443) outbound",
-            "Verify NAT Gateway exists in route table",
-            "Check IAM instance profile has AmazonSSMManagedInstanceCore policy",
-            "Connect via EC2 Instance Connect: systemctl status amazon-ssm-agent"
-        ]
+    """SSM-related errors."""
 
 
 class EC2Error(PublisherRegistrationError):
-    """EC2 instance errors"""
-    def _get_default_troubleshooting(self):
-        return [
-            "Check instance state in EC2 console",
-            "Review EC2 instance logs",
-            "Verify instance type is supported",
-            "Check if instance was manually terminated"
-        ]
+    """EC2 instance errors."""
 
 
 class NetskopeAPIError(PublisherRegistrationError):
-    """Netskope API errors"""
-    def _get_default_troubleshooting(self):
-        return [
-            "Verify API token in Secrets Manager is correct",
-            "Check token has infrastructure management permissions",
-            "Verify tenant FQDN is correct",
-            "Test API manually: curl -H 'Netskope-Api-Token: xxx' https://tenant.goskope.com/api/v2/infrastructure/publishers"
-        ]
+    """Netskope API errors."""
 
 
 class CommandExecutionError(PublisherRegistrationError):
-    """Command execution errors"""
-    def _get_default_troubleshooting(self):
-        return [
-            "Check Lambda logs for stderr output",
-            "Connect via Session Manager and check /var/log/amazon/ssm/",
-            "Manually run: sudo /home/ubuntu/npa_publisher_wizard -token 'test'",
-            "Verify publisher wizard exists at /home/ubuntu/"
-        ]
-
-
-# ==============================================================
-# LOGGING
-# ==============================================================
-
-class SimpleLogger:
-    """Simple logger for Lambda"""
-    def __init__(self, level='INFO'):
-        self.level = level
-
-    def info(self, msg):
-        print(f'[INFO] {msg}')
-
-    def error(self, msg):
-        print(f'[ERROR] {msg}')
-
-    def warning(self, msg):
-        print(f'[WARNING] {msg}')
-
-
-logger = SimpleLogger(level=LOGLEVEL)
+    """Command execution errors."""
 
 
 # ==============================================================
 # MAIN HANDLER
 # ==============================================================
 
+
+def get_remaining_time_ms(context):
+    """Safely get remaining execution time in milliseconds"""
+    try:
+        return context.get_remaining_time_in_millis()
+    except Exception:
+        return None
+
+
+def check_timeout_budget(context, required_seconds=30):
+    """Check if we have enough Lambda execution time remaining"""
+    remaining_ms = get_remaining_time_ms(context)
+    if remaining_ms is not None and remaining_ms < required_seconds * 1000:
+        raise PublisherRegistrationError(
+            "Lambda Timeout",
+            f"Only {remaining_ms / 1000:.0f}s remaining, need {required_seconds}s",
+        )
+
+
+def sanitize_event_for_logging(event):
+    """Remove sensitive fields from event before logging"""
+    safe_event = copy.deepcopy(event)
+    if "ResourceProperties" in safe_event:
+        props = safe_event["ResourceProperties"]
+        for key in ["ServiceToken"]:
+            if key in props:
+                props[key] = "***REDACTED***"
+    return safe_event
+
+
 def lambda_handler(event, context):
     """
     CloudFormation Custom Resource Lambda Handler
     Handles CREATE, UPDATE, DELETE events for NPA Publisher registration
     """
-    # Log complete event payload for debugging
-    logger.info('=' * 80)
-    logger.info('Lambda invoked with event:')
-    logger.info(json.dumps(event, indent=2, default=str))
-    logger.info('=' * 80)
+    logger.info(
+        f"Lambda invoked with event: "
+        f"{json.dumps(sanitize_event_for_logging(event), default=str)}"
+    )
 
     try:
         # Check if this is a CloudFormation Custom Resource event
-        if 'RequestType' not in event:
-            logger.error('Not a CloudFormation Custom Resource event')
-            return {'statusCode': 400, 'body': 'Invalid event type'}
-
-        request_type = event['RequestType']
-        resource_properties = event['ResourceProperties']
-
-        # Extract parameters
-        EC2InstanceId = resource_properties['InstanceId']
-        publisher_group_name = resource_properties['PublisherGroupName']
-        account_id = resource_properties['AccountId']
-
-        # Get Netskope API token
-        token = json.loads(get_secret(secret_name))['token']
-
-        # Generate publisher name
-        publisher_name = publisher_group_name + "-" + account_id + '-' + EC2InstanceId
-
-        # Handle different request types
-        if request_type == 'Delete':
-            logger.info('Processing CloudFormation DELETE event')
-            handle_delete(publisher_name, publisher_group_name, token, instance_id=EC2InstanceId)
-            cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                'Message': 'Publisher deregistered successfully'
-            })
+        if "RequestType" not in event:
+            logger.error("Not a CloudFormation Custom Resource event")
+            # Must send cfnresponse if ResponseURL is present to avoid CloudFormation hang
+            if "ResponseURL" in event:
+                cfnresponse.send(
+                    event,
+                    context,
+                    cfnresponse.FAILED,
+                    {"Error": "Not a CloudFormation Custom Resource event"},
+                )
             return
 
-        elif request_type == 'Create':
-            logger.info('Processing CloudFormation CREATE event')
-            result = handle_create_idempotent(publisher_name, publisher_group_name, EC2InstanceId, token)
+        request_type = event["RequestType"]
+        resource_properties = event.get("ResourceProperties", {})
+
+        # Validate required environment variables
+        if not tenant_fqdn:
+            raise PublisherRegistrationError(
+                "Configuration",
+                "tenant_fqdn environment variable is not set",
+            )
+        if not secret_name:
+            raise PublisherRegistrationError(
+                "Configuration",
+                "api_token environment variable is not set",
+            )
+
+        # Extract parameters with validation
+        ec2_instance_id = resource_properties.get("InstanceId")
+        publisher_name_prefix = resource_properties.get("PublisherNamePrefix")
+        account_id = resource_properties.get("AccountId")
+        app_associations = resource_properties.get("AppAssociations", "None")
+
+        if not ec2_instance_id or not publisher_name_prefix or not account_id:
+            missing = [
+                k
+                for k, v in {
+                    "InstanceId": ec2_instance_id,
+                    "PublisherNamePrefix": publisher_name_prefix,
+                    "AccountId": account_id,
+                }.items()
+                if not v
+            ]
+            raise PublisherRegistrationError(
+                "Parameter Validation",
+                f'Missing required ResourceProperties: {", ".join(missing)}',
+            )
+
+        # Normalize app_associations to string
+        if not isinstance(app_associations, str):
+            app_associations = str(app_associations)
+
+        # Get Netskope API token from SSM Parameter Store
+        token = get_secret(secret_name)
+        if not token:
+            raise PublisherRegistrationError(
+                "Secret Parsing",
+                "API token parameter is empty",
+            )
+
+        # Generate publisher name
+        publisher_name = (
+            f"{publisher_name_prefix}-{account_id}-{ec2_instance_id}"
+        )
+
+        # Handle different request types
+        if request_type == "Delete":
+            logger.info("Processing CloudFormation DELETE event")
+            handle_delete(publisher_name, token, context, instance_id=ec2_instance_id)
+            cfnresponse.send(
+                event,
+                context,
+                cfnresponse.SUCCESS,
+                {"Message": "Publisher deregistered successfully"},
+            )
+            return
+
+        if request_type == "Create":
+            logger.info("Processing CloudFormation CREATE event")
+            result = handle_create(
+                publisher_name, app_associations, ec2_instance_id, token, context
+            )
             cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
             return
 
-        elif request_type == 'Update':
-            # UPDATE events are rare but can occur if CloudFormation properties change
-            # without triggering a replacement (e.g., tags or other non-critical properties)
-            logger.info('Processing CloudFormation UPDATE event - no action needed')
-            cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                'Message': 'Update completed (no changes required)'
-            })
+        if request_type == "Update":
+            logger.info("Processing CloudFormation UPDATE event - no action needed")
+            cfnresponse.send(
+                event,
+                context,
+                cfnresponse.SUCCESS,
+                {"Message": "Update completed (no changes required)"},
+            )
             return
 
-        else:
-            logger.error(f'Unknown request type: {request_type}')
-            cfnresponse.send(event, context, cfnresponse.FAILED, {
-                'Error': f'Unknown request type: {request_type}'
-            })
+        logger.error(f"Unknown request type: {request_type}")
+        cfnresponse.send(
+            event,
+            context,
+            cfnresponse.FAILED,
+            {"Error": f"Unknown request type: {request_type}"},
+        )
 
     except PublisherRegistrationError as e:
-        logger.error(e.format_error())
-        cfnresponse.send(event, context, cfnresponse.FAILED, {
-            'Error': str(e),
-            'Phase': e.phase,
-            'Troubleshooting': e.troubleshooting
-        })
+        logger.error(f"[{e.phase}] {e.details}")
+        cfnresponse.send(
+            event,
+            context,
+            cfnresponse.FAILED,
+            {"Error": str(e), "Phase": e.phase},
+        )
 
-    except Exception as e:
-        logger.error(f'Exception in lambda_handler: {str(e)}')
-        import traceback
-        logger.error(traceback.format_exc())
-        cfnresponse.send(event, context, cfnresponse.FAILED, {
-            'Error': str(e)
-        })
-
-
-# ==============================================================
-# IDEMPOTENT CREATE HANDLER
-# ==============================================================
-
-def handle_create_idempotent(publisher_name, publisher_group_name, EC2InstanceId, token):
-    """
-    Idempotent version of handle_create
-    Checks if publisher already exists for this instance before creating
-
-    Args:
-        publisher_name: Generated publisher name
-        publisher_group_name: Publisher group name
-        EC2InstanceId: EC2 instance ID
-        token: Netskope API token
-
-    Returns:
-        dict: Publisher registration results
-    """
-    logger.info('Checking if publisher already exists...')
-
-    # Check if publisher already exists
-    try:
-        api_url = '/api/v2/infrastructure/publishers'
-        resp = call_netskope_api_with_retry('get', api_url, token, None)
-
-        if resp['status'] == 'success' and 'data' in resp:
-            publishers = resp['data'].get('publishers', [])
-
-            # Look for existing publisher with this name
-            for pub in publishers:
-                if pub.get('publisher_name') == publisher_name:
-                    publisher_id = pub.get('publisher_id')
-                    logger.info(f'Publisher already exists with ID: {publisher_id}')
-                    logger.info('Returning existing publisher (idempotent operation)')
-
-                    # Return existing publisher info
-                    return {
-                        'PublisherId': publisher_id,
-                        'PublisherName': publisher_name,
-                        'Status': 'AlreadyExists',
-                        'AppsUpdated': 0,
-                        'Idempotent': True
-                    }
-
-    except Exception as e:
-        logger.warning(f'Error checking for existing publisher: {str(e)}')
-        logger.info('Proceeding with creation anyway...')
-
-    # Publisher doesn't exist - create new one
-    logger.info('Publisher does not exist. Creating new publisher...')
-    return handle_create(publisher_name, publisher_group_name, EC2InstanceId, token)
+    except Exception:
+        logger.exception("Exception in lambda_handler")
+        cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": "Internal error"})
 
 
 # ==============================================================
 # CREATE HANDLER
 # ==============================================================
 
-def handle_create(publisher_name, publisher_group_name, EC2InstanceId, token):
+
+def handle_create(
+    publisher_name, app_associations, ec2_instance_id, token, context=None
+):
     """
     Handle CloudFormation CREATE event - register publisher with Netskope
+
+    Args:
+        publisher_name: Generated publisher name
+        app_associations: App association mode - 'None', 'All', or comma-separated app names
+        ec2_instance_id: EC2 instance ID
+        token: Netskope API token
+        context: Lambda context for timeout awareness
 
     Steps:
     1. Create publisher and request registration token from Netskope API
@@ -272,313 +259,407 @@ def handle_create(publisher_name, publisher_group_name, EC2InstanceId, token):
     # STEP 1: Create Publisher and Request Registration Token
     # ==============================================================
 
-    logger.info('Creating a new publisher: ' + publisher_name)
+    check_timeout_budget(context, required_seconds=300)
+    logger.info(f"Creating a new publisher: {publisher_name}")
 
     # Create publisher in Netskope
-    api_url = '/api/v2/infrastructure/publishers'
-    payload = {'name': publisher_name}
+    api_url = "/api/v2/infrastructure/publishers"
+    payload = {"name": publisher_name}
 
     try:
-        resp = call_netskope_api_with_retry('post', api_url, token, payload)
+        resp = call_netskope_api_with_retry("post", api_url, token, payload)
     except Exception as e:
-        raise NetskopeAPIError('Publisher Creation', str(e))
+        raise NetskopeAPIError("Publisher Creation", str(e)) from e
 
     # Handle case where publisher already exists
-    if resp['status'] != 'success':
-        if resp.get('message', '').find('may exist already') != -1:
-            logger.info('Publisher already exists. Getting existing publisher ID...')
-            resp = call_netskope_api_with_retry('get', api_url, token, None)
-            publishers = resp['data']['publishers']
+    if resp["status"] != "success":
+        if resp.get("message", "").find("may exist already") != -1:
+            logger.info("Publisher already exists. Getting existing publisher ID...")
+            resp = call_netskope_api_with_retry("get", api_url, token, None)
+            publishers = resp.get("data", {}).get("publishers", [])
             publisher_id = None
             for publisher in publishers:
-                if publisher['publisher_name'] == publisher_name:
-                    publisher_id = publisher['publisher_id']
+                if publisher.get("publisher_name") == publisher_name:
+                    publisher_id = publisher.get("publisher_id")
                     break
             if publisher_id is None:
-                raise NetskopeAPIError('Publisher Lookup', 'Publisher exists but could not find ID')
-        else:
-            raise NetskopeAPIError('Publisher Creation', resp.get('message', 'Unknown error'))
-    else:
-        publisher_id = resp['data']['id']
+                raise NetskopeAPIError(
+                    "Publisher Lookup", "Publisher exists but could not find ID"
+                )
+            # Publisher already exists — skip re-registration
+            logger.info(
+                f"Publisher already registered with ID: {publisher_id}. "
+                "Skipping registration."
+            )
+            return {
+                "PublisherId": publisher_id,
+                "PublisherName": publisher_name,
+                "Status": "AlreadyExists",
+                "AppsUpdated": 0,
+                "Idempotent": True,
+            }
+        raise NetskopeAPIError(
+            "Publisher Creation", resp.get("message", "Unknown error")
+        )
 
-    logger.info('Publisher ID is: ' + str(publisher_id))
+    publisher_id = resp.get("data", {}).get("id")
+    if publisher_id is None:
+        raise NetskopeAPIError(
+            "Publisher Creation",
+            "API returned success but no publisher ID in response",
+        )
+
+    logger.info(f"Publisher ID is: {publisher_id}")
 
     # Request registration token from Netskope
-    logger.info('Getting registration token from Netskope...')
-    api_url = '/api/v2/infrastructure/publishers/' + str(publisher_id) + '/registration_token'
+    logger.info("Getting registration token from Netskope...")
+    api_url = f"/api/v2/infrastructure/publishers/{publisher_id}/registration_token"
 
     try:
-        resp = call_netskope_api_with_retry('post', api_url, token, None)
+        resp = call_netskope_api_with_retry("post", api_url, token, None)
     except Exception as e:
-        raise NetskopeAPIError('Registration Token', str(e))
+        raise NetskopeAPIError("Registration Token", str(e)) from e
 
-    if resp['status'] != 'success':
-        raise NetskopeAPIError('Registration Token', resp.get('message', 'Failed to get registration token'))
+    if resp["status"] != "success":
+        raise NetskopeAPIError(
+            "Registration Token",
+            resp.get("message", "Failed to get registration token"),
+        )
 
-    reg_token = resp['data']['token']
-    logger.info('Successfully obtained registration token')
+    reg_token = resp.get("data", {}).get("token")
+    if not reg_token:
+        raise NetskopeAPIError(
+            "Registration Token", "API returned success but no token in response"
+        )
+    logger.info("Successfully obtained registration token")
 
     # ==============================================================
     # STEP 2: Check EC2 Instance State
     # ==============================================================
 
-    logger.info('Checking EC2 instance state...')
-    ec2_client = boto3.client('ec2')
+    check_timeout_budget(context, required_seconds=240)
+    logger.info("Checking EC2 instance state...")
 
     try:
-        ec2_ready = wait_for_instance_running(ec2_client, EC2InstanceId, max_wait=EC2_READY_TIMEOUT)
+        ec2_ready = wait_for_instance_running(
+            ec2_client, ec2_instance_id, context, max_wait=EC2_READY_TIMEOUT
+        )
         if not ec2_ready:
-            raise EC2Error('EC2 State Check', f'Instance did not enter running state within {EC2_READY_TIMEOUT}s')
+            raise EC2Error(
+                "EC2 State Check",
+                f"Instance did not enter running state within {EC2_READY_TIMEOUT}s",
+            )
     except PublisherRegistrationError:
         raise
     except Exception as e:
-        raise EC2Error('EC2 State Check', str(e))
+        raise EC2Error("EC2 State Check", str(e)) from e
 
-    logger.info('Instance is running, proceeding to SSM check')
+    logger.info("Instance is running, proceeding to SSM check")
 
     # ==============================================================
     # STEP 3: Wait for SSM Agent with Exponential Backoff
     # ==============================================================
 
-    logger.info('Waiting for instance to register with Systems Manager...')
-    ssm_client = boto3.client('ssm')
+    logger.info("Waiting for instance to register with Systems Manager...")
 
     # Use exponential backoff: 5s, 10s, 15s, 20s, 30s, 30s, 30s...
     wait_times = [5, 10, 15, 20, 30, 30, 30, 30, 30, 30]
     instance_ready = False
 
     for attempt, wait_time in enumerate(wait_times):
-        logger.info(f'SSM check attempt {attempt + 1}/{len(wait_times)}')
+        remaining = get_remaining_time_ms(context)
+        if remaining is not None and remaining < 30000:
+            logger.warning("Aborting SSM wait - Lambda timeout approaching")
+            break
+
+        logger.info(f"SSM check attempt {attempt + 1}/{len(wait_times)}")
 
         try:
             response = ssm_client.describe_instance_information(
-                Filters=[{'Key': 'InstanceIds', 'Values': [EC2InstanceId]}]
+                Filters=[{"Key": "InstanceIds", "Values": [ec2_instance_id]}]
             )
 
             # Check if instance is registered and online
-            if len(response['InstanceInformationList']) > 0:
-                instance_info = response['InstanceInformationList'][0]
-                ping_status = instance_info['PingStatus']
-                platform = instance_info.get('PlatformType', 'Unknown')
-                agent_version = instance_info.get('AgentVersion', 'Unknown')
+            if len(response["InstanceInformationList"]) > 0:
+                instance_info = response["InstanceInformationList"][0]
+                ping_status = instance_info["PingStatus"]
+                platform = instance_info.get("PlatformType", "Unknown")
+                agent_version = instance_info.get("AgentVersion", "Unknown")
 
-                logger.info(f'Instance found in SSM - Status: {ping_status}, Platform: {platform}, Agent: {agent_version}')
+                logger.info(
+                    f"Instance found in SSM - Status: {ping_status}, "
+                    f"Platform: {platform}, Agent: {agent_version}"
+                )
 
-                if ping_status == 'Online':
-                    logger.info('Instance is online in SSM!')
+                if ping_status == "Online":
+                    logger.info("Instance is online in SSM!")
                     instance_ready = True
                     break
-                else:
-                    logger.info(f'Instance registered but not online yet (Status: {ping_status})')
+                logger.info(
+                    f"Instance registered but not online yet (Status: {ping_status})"
+                )
             else:
-                logger.info('Instance not yet visible in SSM')
+                logger.info("Instance not yet visible in SSM")
 
         except Exception as e:
-            logger.warning(f'Error checking SSM status: {str(e)}')
+            logger.warning(f"Error checking SSM status: {e}")
 
         # Wait before next attempt (unless this was the last attempt)
         if attempt < len(wait_times) - 1:
-            logger.info(f'Waiting {wait_time} seconds before retry...')
+            logger.info(f"Waiting {wait_time} seconds before retry...")
             time.sleep(wait_time)
 
     if not instance_ready:
-        raise SSMError('SSM Agent Registration',
-                      f'Instance did not become available in Systems Manager after {SSM_READY_TIMEOUT}s')
+        raise SSMError(
+            "SSM Agent Registration",
+            f"Instance did not become available in Systems Manager after {SSM_READY_TIMEOUT}s",
+        )
 
     # ==============================================================
     # STEP 4: Send Command via SSM and Wait for Completion
     # ==============================================================
 
-    logger.info('Sending registration command to instance via SSM...')
+    check_timeout_budget(context, required_seconds=120)
+    logger.info("Sending registration command to instance via SSM...")
 
     # Build the command with registration token
-    command = "sudo /home/ubuntu/npa_publisher_wizard -token " + "\"" + reg_token + "\""
+    command = f'sudo /home/ubuntu/npa_publisher_wizard -token "{reg_token}"'
 
     # Send command via SSM Run Command
     try:
         response = ssm_client.send_command(
-            InstanceIds=[EC2InstanceId],
+            InstanceIds=[ec2_instance_id],
             DocumentName="AWS-RunShellScript",
-            Comment='Registering NPA publisher with Netskope',
-            Parameters={'commands': [command]},
-            TimeoutSeconds=COMMAND_TIMEOUT
+            Comment="Registering NPA publisher with Netskope",
+            Parameters={"commands": [command]},
+            TimeoutSeconds=COMMAND_TIMEOUT,
         )
     except Exception as e:
-        raise SSMError('Send Command', str(e))
+        raise SSMError("Send Command", str(e)) from e
 
-    command_id = response['Command']['CommandId']
-    logger.info(f'SSM command sent. Command ID: {command_id}')
+    command_id = response["Command"]["CommandId"]
+    logger.info(f"SSM command sent. Command ID: {command_id}")
 
     # Wait for command to complete
     try:
         command_success = wait_for_command_completion(
-            ssm_client,
-            command_id,
-            EC2InstanceId,
-            max_wait=COMMAND_TIMEOUT
+            ssm_client, command_id, ec2_instance_id, context, max_wait=COMMAND_TIMEOUT
         )
 
         if not command_success:
-            raise CommandExecutionError('Command Execution',
-                                       'Publisher registration command failed')
+            raise CommandExecutionError(
+                "Command Execution", "Publisher registration command failed"
+            )
     except PublisherRegistrationError:
         raise
     except Exception as e:
-        raise CommandExecutionError('Command Execution', str(e))
+        raise CommandExecutionError("Command Execution", str(e)) from e
 
-    logger.info('Publisher registration command completed successfully')
+    logger.info("Publisher registration command completed successfully")
 
     # ==============================================================
     # STEP 5: Update Private Applications
     # ==============================================================
 
-    logger.info('Updating private applications to use new publisher...')
-
-    # Get all private apps
-    api_url = '/api/v2/steering/apps/private'
-
-    try:
-        resp = call_netskope_api_with_retry('get', api_url, token, None)
-    except Exception as e:
-        raise NetskopeAPIError('Fetch Private Apps', str(e))
-
-    if resp['status'] != 'success':
-        raise NetskopeAPIError('Fetch Private Apps', resp.get('message', 'Failed to fetch private applications'))
-
-    # Update apps matching the publisher group name
-    private_apps = resp['data']['private_apps']
+    check_timeout_budget(context, required_seconds=60)
     apps_updated = 0
 
-    for app in private_apps:
-        # Skip apps that don't match the naming convention
-        if app['app_name'].find(publisher_group_name) == -1:
-            continue
+    # AppAssociations: 'None' = skip, 'All' = all apps, or comma-separated list of app names
+    if app_associations.strip().lower() == "none":
+        logger.info('AppAssociations is "None" - skipping private app updates')
+    else:
+        logger.info(
+            f"Updating private applications (AppAssociations: {app_associations})..."
+        )
 
-        logger.info(f'Found matching private app: {app["app_name"]}')
-
-        private_app_id = app['app_id']
-        service_publisher_assignments = app['service_publisher_assignments']
-
-        # Check if publisher already assigned
-        publisher_already_assigned = False
-        for pub in service_publisher_assignments:
-            if pub['publisher_id'] == publisher_id:
-                publisher_already_assigned = True
-                logger.info(f'Publisher already assigned to {app["app_name"]}')
-                break
-
-        # Skip if already assigned
-        if publisher_already_assigned:
-            continue
-
-        # Add publisher to app
-        service_publisher_assignments.append({'publisher_id': publisher_id})
-        payload = {'publishers': service_publisher_assignments}
-
-        api_url = '/api/v2/steering/apps/private/' + str(private_app_id)
+        # Get all private apps
+        api_url = "/api/v2/steering/apps/private"
 
         try:
-            resp = call_netskope_api_with_retry('patch', api_url, token, payload)
+            resp = call_netskope_api_with_retry("get", api_url, token, None)
         except Exception as e:
-            logger.warning(f'Error updating app {app["app_name"]}: {str(e)}')
-            continue
+            raise NetskopeAPIError("Fetch Private Apps", str(e)) from e
 
-        if resp['status'] != 'success':
-            logger.warning(f'Got error updating app {app["app_name"]}: ' + json.dumps(resp))
-            # Don't fail - continue with other apps
-            continue
+        if resp["status"] != "success":
+            raise NetskopeAPIError(
+                "Fetch Private Apps",
+                resp.get("message", "Failed to fetch private applications"),
+            )
 
-        logger.info(f'Successfully added publisher to app: {app["app_name"]}')
-        apps_updated += 1
+        private_apps = resp.get("data", {}).get("private_apps", [])
 
-    logger.info(f'Publisher registration completed. Updated {apps_updated} private applications')
+        # Build target app list
+        if app_associations.strip().lower() == "all":
+            target_apps = private_apps
+        else:
+            # Comma-separated list of app names
+            target_app_names = [
+                name.strip() for name in app_associations.split(",") if name.strip()
+            ]
+
+            # Match app names with or without square brackets
+            # Netskope API may return names like "[App Name]" while users
+            # provide "App Name" — match either form
+            def app_name_matches(api_name, target_name):
+                """Check if app name matches, ignoring optional brackets."""
+                if api_name == target_name:
+                    return True
+                stripped = api_name.strip("[]")
+                return stripped == target_name or stripped == target_name.strip("[]")
+
+            target_apps = [
+                app
+                for app in private_apps
+                if any(
+                    app_name_matches(app.get("app_name", ""), name)
+                    for name in target_app_names
+                )
+            ]
+
+            # Warn about any app names that weren't found
+            found_names = {app.get("app_name", "").strip("[]") for app in target_apps}
+            missing = [
+                name
+                for name in target_app_names
+                if name.strip("[]") not in found_names
+            ]
+            if missing:
+                logger.warning(f'Private apps not found: {", ".join(missing)}')
+
+        for app in target_apps:
+            private_app_id = app.get("app_id")
+            if not private_app_id:
+                logger.warning(
+                    f'Skipping app with missing app_id: {app.get("app_name", "unknown")}'
+                )
+                continue
+            service_publisher_assignments = app.get("service_publisher_assignments", [])
+
+            # Check if publisher already assigned
+            publisher_already_assigned = False
+            for pub in service_publisher_assignments:
+                if pub["publisher_id"] == publisher_id:
+                    publisher_already_assigned = True
+                    logger.info(f'Publisher already assigned to {app["app_name"]}')
+                    break
+
+            if publisher_already_assigned:
+                continue
+
+            # Add publisher to app
+            service_publisher_assignments.append({"publisher_id": publisher_id})
+            payload = {"publishers": service_publisher_assignments}
+
+            app_api_url = f"/api/v2/steering/apps/private/{private_app_id}"
+
+            try:
+                resp = call_netskope_api_with_retry(
+                    "patch", app_api_url, token, payload
+                )
+            except Exception as e:
+                logger.warning(f'Error updating app {app["app_name"]}: {e}')
+                continue
+
+            if resp["status"] != "success":
+                logger.warning(
+                    f'Got error updating app {app["app_name"]}: {json.dumps(resp)}'
+                )
+                continue
+
+            logger.info(f'Successfully added publisher to app: {app["app_name"]}')
+            apps_updated += 1
+
+        logger.info(
+            f"Publisher registration completed. Updated {apps_updated} private applications"
+        )
 
     return {
-        'PublisherId': publisher_id,
-        'PublisherName': publisher_name,
-        'Status': 'Registered',
-        'AppsUpdated': apps_updated,
-        'Idempotent': False
+        "PublisherId": publisher_id,
+        "PublisherName": publisher_name,
+        "Status": "Registered",
+        "AppsUpdated": apps_updated,
+        "Idempotent": False,
     }
 
 
 # ==============================================================
 # HELPER FUNCTION - Remove Publisher from Apps
-# ==============================================================
+# ========================================================
 
-def remove_publisher_from_apps(publisher_id, publisher_group_name, token):
+
+def remove_publisher_from_apps(publisher_id, token):
     """
-    Remove a publisher from all private applications matching the naming convention
+    Remove a publisher from all private applications it is assigned to
 
     Args:
         publisher_id: Publisher ID to remove
-        publisher_group_name: Publisher group name for filtering apps
         token: Netskope API token
 
     Returns:
         Number of apps updated
     """
-    logger.info(f'Removing publisher {publisher_id} from private apps...')
+    logger.info(f"Removing publisher {publisher_id} from all private apps...")
 
-    api_url = '/api/v2/steering/apps/private'
+    api_url = "/api/v2/steering/apps/private"
 
     try:
-        resp = call_netskope_api_with_retry('get', api_url, token, None)
+        resp = call_netskope_api_with_retry("get", api_url, token, None)
     except Exception as e:
-        logger.error(f'Error fetching private apps: {str(e)}')
+        logger.error(f"Error fetching private apps: {e}")
         raise
 
-    if resp['status'] != 'success':
-        logger.error('Got error while calling ' + api_url)
-        logger.error('Response: ' + json.dumps(resp))
-        raise Exception('Failed to fetch private applications')
+    if resp["status"] != "success":
+        logger.error(f"Got error while calling {api_url}")
+        logger.error(f"Response: {json.dumps(resp)}")
+        raise NetskopeAPIError(
+            "Fetch Private Apps", resp.get("message", "Unknown error")
+        )
 
-    private_apps = resp['data']['private_apps']
+    private_apps = resp.get("data", {}).get("private_apps", [])
     apps_updated = 0
 
     for app in private_apps:
-        # Skip apps that don't match the naming convention
-        if app['app_name'].find(publisher_group_name) == -1:
+        private_app_id = app.get("app_id")
+        if not private_app_id:
+            logger.warning(
+                f'Skipping app with missing app_id: {app.get("app_name", "unknown")}'
+            )
             continue
-
-        logger.info(f'Checking private app: {app["app_name"]}')
-
-        private_app_id = app['app_id']
-        api_url = '/api/v2/steering/apps/private/' + str(private_app_id)
-        service_publisher_assignments = app['service_publisher_assignments']
+        service_publisher_assignments = app.get("service_publisher_assignments", [])
 
         # Find and remove publisher
         publisher_used = False
         updated_assignments = []
 
         for pub in service_publisher_assignments:
-            if pub['publisher_id'] == publisher_id:
+            if pub["publisher_id"] == publisher_id:
                 logger.info(f'Removing publisher from app: {app["app_name"]}')
                 publisher_used = True
             else:
                 updated_assignments.append(pub)
 
         if not publisher_used:
-            logger.info(f'Publisher not in use by {app["app_name"]}')
             continue
 
         # Update app with publisher removed
-        payload = {'publishers': updated_assignments}
+        app_api_url = f"/api/v2/steering/apps/private/{private_app_id}"
+        payload = {"publishers": updated_assignments}
 
         try:
-            resp = call_netskope_api_with_retry('patch', api_url, token, payload)
+            resp = call_netskope_api_with_retry("patch", app_api_url, token, payload)
         except Exception as e:
-            logger.error(f'Error updating app {app["app_name"]}: {str(e)}')
+            logger.error(f'Error updating app {app["app_name"]}: {e}')
             continue
 
-        if resp['status'] != 'success':
-            logger.error(f'Got error updating app {app["app_name"]}: ' + json.dumps(resp))
-            # Continue even if app update fails
+        if resp["status"] != "success":
+            logger.error(
+                f'Got error updating app {app["app_name"]}: {json.dumps(resp)}'
+            )
         else:
             logger.info(f'Successfully removed publisher from app: {app["app_name"]}')
             apps_updated += 1
 
-    logger.info(f'Removed publisher from {apps_updated} private applications')
+    logger.info(f"Removed publisher from {apps_updated} private applications")
     return apps_updated
 
 
@@ -586,116 +667,138 @@ def remove_publisher_from_apps(publisher_id, publisher_group_name, token):
 # DELETE HANDLER
 # ==============================================================
 
-def handle_delete(publisher_name, publisher_group_name, token, instance_id=None):
+
+def handle_delete(publisher_name, token, context=None, instance_id=None):
     """
     Handle CloudFormation DELETE event - deregister publisher from Netskope
 
     Args:
         publisher_name: Name of publisher to delete
-        publisher_group_name: Publisher group name
         token: Netskope API token
+        context: Lambda context for timeout awareness
         instance_id: EC2 instance ID (optional, used to stop instance for disconnection)
     """
-    logger.info('Deregistering publisher: ' + publisher_name)
+    check_timeout_budget(context, required_seconds=120)
+    logger.info(f"Deregistering publisher: {publisher_name}")
 
     # Get publisher ID
-    api_url = '/api/v2/infrastructure/publishers'
+    api_url = "/api/v2/infrastructure/publishers"
     publisher_id = 0
 
     try:
-        resp = call_netskope_api_with_retry('get', api_url, token, None)
-        publishers = resp['data']['publishers']
+        resp = call_netskope_api_with_retry("get", api_url, token, None)
+        publishers = resp.get("data", {}).get("publishers", [])
 
         for publisher in publishers:
-            if publisher['publisher_name'] == publisher_name:
-                publisher_id = publisher['publisher_id']
+            if publisher.get("publisher_name") == publisher_name:
+                publisher_id = publisher.get("publisher_id", 0)
                 break
     except Exception as e:
-        logger.warning(f'Error looking up publisher: {str(e)}')
+        logger.warning(f"Error looking up publisher: {e}")
 
     if publisher_id == 0:
-        logger.warning(f'Publisher {publisher_name} not found. May have been already deleted.')
+        logger.warning(
+            f"Publisher {publisher_name} not found. May have been already deleted."
+        )
         return
 
-    logger.info(f'Found publisher ID: {publisher_id}')
+    logger.info(f"Found publisher ID: {publisher_id}")
 
     # Stop EC2 instance to trigger publisher disconnect
     if instance_id:
         try:
-            logger.info(f'Stopping EC2 instance {instance_id} to disconnect publisher...')
-            ec2_client = boto3.client('ec2', region_name=AWS_REGION)
+            logger.info(
+                f"Stopping EC2 instance {instance_id} to disconnect publisher..."
+            )
             ec2_client.stop_instances(InstanceIds=[instance_id])
-            logger.info(f'EC2 stop request sent for instance {instance_id}')
+            logger.info(f"EC2 stop request sent for instance {instance_id}")
         except Exception as e:
-            logger.warning(f'Could not stop EC2 instance: {str(e)}')
-            logger.warning('Continuing with deletion anyway...')
+            logger.warning(f"Could not stop EC2 instance: {e}")
+            logger.warning("Continuing with deletion anyway...")
 
     # Remove publisher from all private apps using helper function
     try:
-        apps_updated = remove_publisher_from_apps(publisher_id, publisher_group_name, token)
-
-        # Wait for Netskope to propagate the app disassociation
-        # This is critical - the API has eventual consistency and may still report
-        # apps associated even after the PATCH succeeds
-        if apps_updated > 0:
-            logger.info('Waiting for app disassociation to propagate...')
-            apps_cleared = wait_for_publisher_apps_cleared(publisher_id, token, max_wait=60)
-            if not apps_cleared:
-                logger.warning('App disassociation may not have fully propagated - will retry deletion if needed')
+        remove_publisher_from_apps(publisher_id, token)
     except Exception as e:
-        logger.warning(f'Error removing publisher from apps: {str(e)}')
-        logger.warning('Continuing with publisher deletion...')
+        logger.warning(f"Error removing publisher from apps: {e}")
+        logger.warning("Continuing with publisher deletion...")
 
     # Wait for publisher to disconnect BEFORE attempting deletion
     # The Netskope API will reject deletion if publisher is still connected
-    logger.info(f'Waiting for publisher to disconnect before deletion...')
-    disconnected = wait_for_publisher_disconnected(publisher_id, token, max_wait=PUBLISHER_DISCONNECT_TIMEOUT)
+    logger.info("Waiting for publisher to disconnect before deletion...")
+    disconnected = wait_for_publisher_disconnected(
+        publisher_id, token, context, max_wait=PUBLISHER_DISCONNECT_TIMEOUT
+    )
 
     if not disconnected:
-        logger.warning(f'Publisher {publisher_name} did not disconnect within {PUBLISHER_DISCONNECT_TIMEOUT} seconds')
-        logger.warning('Attempting deletion anyway - may fail if still connected')
+        logger.warning(
+            f"Publisher {publisher_name} did not disconnect "
+            f"within {PUBLISHER_DISCONNECT_TIMEOUT} seconds"
+        )
+        logger.warning("Attempting deletion anyway - may fail if still connected")
     else:
-        logger.info(f'Publisher {publisher_name} successfully disconnected')
+        logger.info(f"Publisher {publisher_name} successfully disconnected")
 
-    # Now delete publisher from Netskope with retry logic for eventual consistency
-    api_url = '/api/v2/infrastructure/publishers/' + str(publisher_id)
-    max_delete_attempts = 5
-    delete_retry_interval = 5  # seconds between retries
+    # Now delete publisher from Netskope with retry logic for eventual consistency.
+    # The Netskope API may still report app associations even after PATCHes succeed,
+    # so on each retry we re-remove the publisher from apps to force propagation.
+    api_url = f"/api/v2/infrastructure/publishers/{publisher_id}"
+    max_delete_attempts = 8
+    delete_retry_interval = 10  # seconds between retries
 
     for attempt in range(max_delete_attempts):
         try:
-            resp = call_netskope_api_with_retry('delete', api_url, token, None)
+            resp = call_netskope_api_with_retry("delete", api_url, token, None)
         except Exception as e:
-            logger.error(f'Error deleting publisher: {str(e)}')
+            logger.error(f"Error deleting publisher: {e}")
             raise
 
-        if resp['status'] == 'success':
-            logger.info(f'Successfully completed deletion of publisher: {publisher_name}')
+        if resp["status"] == "success":
+            logger.info(
+                f"Successfully completed deletion of publisher: {publisher_name}"
+            )
             return
 
         # Check if failure is due to app association (eventual consistency issue)
-        error_message = resp.get('message', '')
-        if 'associated with' in error_message and 'apps' in error_message:
+        error_message = resp.get("message", "")
+        if "associated with" in error_message and "apps" in error_message:
             if attempt < max_delete_attempts - 1:
-                logger.warning(f'Publisher still associated with apps (attempt {attempt + 1}/{max_delete_attempts})')
-                logger.info(f'Waiting {delete_retry_interval}s for eventual consistency...')
+                logger.warning(
+                    f"Publisher still associated with apps "
+                    f"(attempt {attempt + 1}/{max_delete_attempts})"
+                )
+                # Re-remove publisher from apps to force propagation
+                try:
+                    remove_publisher_from_apps(publisher_id, token)
+                except Exception as e:
+                    logger.warning(f"Re-remove from apps failed: {e}")
+                logger.info(
+                    f"Waiting {delete_retry_interval}s for eventual consistency..."
+                )
                 time.sleep(delete_retry_interval)
                 continue
-            else:
-                logger.error('Publisher deletion failed after all retries - still associated with apps')
-                logger.error('Got error while deleting publisher: ' + json.dumps(resp))
-                raise Exception('Failed to delete publisher - still associated with apps after retries')
-        else:
-            # Different error - fail immediately
-            logger.error('Got error while deleting publisher: ' + json.dumps(resp))
-            raise Exception('Failed to delete publisher')
+            logger.error(
+                "Publisher deletion failed after all retries - still associated with apps"
+            )
+            logger.error(f"Got error while deleting publisher: {json.dumps(resp)}")
+            raise NetskopeAPIError(
+                "Publisher Deletion",
+                "Still associated with apps after retries",
+            )
 
-    logger.info(f'Successfully completed deletion of publisher: {publisher_name}')
+        # Different error - fail immediately
+        logger.error(f"Got error while deleting publisher: {json.dumps(resp)}")
+        raise NetskopeAPIError(
+            "Publisher Deletion", resp.get("message", "Unknown error")
+        )
+
+    logger.info(f"Successfully completed deletion of publisher: {publisher_name}")
 
 
 # ==============================================================
 # HELPER FUNCTIONS
 # ==============================================================
+
 
 def call_netskope_api_with_retry(method, api_url, token, req_payload, max_retries=3):
     """
@@ -717,23 +820,23 @@ def call_netskope_api_with_retry(method, api_url, token, req_payload, max_retrie
     for attempt in range(max_retries):
         try:
             return call_netskope_api(method, api_url, token, req_payload)
-        except (requests.RequestException, ClientError, ConnectionError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, ClientError, ConnectionError) as e:
             if attempt == max_retries - 1:
                 # Last attempt failed
-                logger.error(f'API call failed after {max_retries} attempts')
+                logger.error(f"API call failed after {max_retries} attempts")
                 raise
 
             # Calculate exponential backoff: 1s, 2s, 4s
-            wait_time = 2 ** attempt
-            logger.warning(f'API call attempt {attempt + 1} failed: {str(e)}')
-            logger.info(f'Retrying in {wait_time} seconds...')
+            wait_time = 2**attempt
+            logger.warning(f"API call attempt {attempt + 1} failed: {e}")
+            logger.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
 
     # Should never reach here, but just in case
-    raise Exception('Unexpected error in API retry logic')
+    raise NetskopeAPIError("API Retry", "Unexpected error in API retry logic")
 
 
-def wait_for_publisher_disconnected(publisher_id, token, max_wait=120):
+def wait_for_publisher_disconnected(publisher_id, token, context=None, max_wait=120):
     """
     Wait for publisher to disconnect after deletion request
     Polls publisher status until it's no longer 'connected'
@@ -741,224 +844,283 @@ def wait_for_publisher_disconnected(publisher_id, token, max_wait=120):
     Args:
         publisher_id: Publisher ID to check
         token: Netskope API token
+        context: Lambda context for timeout awareness
         max_wait: Maximum seconds to wait (default: 120)
 
     Returns:
         bool: True if disconnected, False if timeout
     """
-    logger.info(f'Waiting for publisher {publisher_id} to disconnect...')
+    logger.info(f"Waiting for publisher {publisher_id} to disconnect...")
 
-    api_url = f'/api/v2/infrastructure/publishers/{publisher_id}'
+    api_url = f"/api/v2/infrastructure/publishers/{publisher_id}"
     elapsed = 0
     wait_interval = 5  # Check every 5 seconds
 
     while elapsed < max_wait:
-        try:
-            resp = call_netskope_api_with_retry('get', api_url, token, None, max_retries=2)
+        remaining = get_remaining_time_ms(context)
+        if remaining is not None and remaining < 15000:
+            logger.warning("Aborting disconnect wait - Lambda timeout approaching")
+            return False
 
-            if resp['status'] == 'success' and 'data' in resp:
-                publisher_status = resp['data'].get('status', '')
-                logger.info(f'Publisher status: "{publisher_status}" (elapsed: {elapsed}s)')
+        try:
+            resp = call_netskope_api_with_retry(
+                "get", api_url, token, None, max_retries=2
+            )
+
+            if resp["status"] == "success" and "data" in resp:
+                publisher_status = resp["data"].get("status", "")
+                logger.info(
+                    f'Publisher status: "{publisher_status}" (elapsed: {elapsed}s)'
+                )
 
                 # Success condition: any status that is NOT "connected"
-                if publisher_status != 'connected':
-                    logger.info(f'Publisher disconnected (status: "{publisher_status}") after {elapsed} seconds')
+                if publisher_status != "connected":
+                    logger.info(
+                        f"Publisher disconnected (status: "
+                        f'"{publisher_status}") after {elapsed} seconds'
+                    )
                     return True
 
                 # Publisher is still connected - keep waiting
-                logger.info(f'Publisher still connected, waiting... ({elapsed}/{max_wait}s)')
+                logger.info(
+                    f"Publisher still connected, waiting... ({elapsed}/{max_wait}s)"
+                )
                 time.sleep(wait_interval)
                 elapsed += wait_interval
 
             else:
                 # If we can't get publisher info, it may have been deleted
-                logger.info('Publisher not found - may have been deleted successfully')
+                logger.info("Publisher not found - may have been deleted successfully")
                 return True
 
         except Exception as e:
-            logger.warning(f'Error checking publisher status: {str(e)}')
+            logger.warning(f"Error checking publisher status: {e}")
             # If we get an error, the publisher may no longer exist
             return True
 
-    logger.warning(f'Timeout waiting for publisher to disconnect after {max_wait} seconds')
+    logger.warning(
+        f"Timeout waiting for publisher to disconnect after {max_wait} seconds"
+    )
     return False
 
 
-def wait_for_publisher_apps_cleared(publisher_id, token, max_wait=60):
+def wait_for_publisher_apps_cleared(publisher_id, token, context=None, max_wait=60):
     """
-    Wait for publisher to have no associated apps after removal
-    Polls publisher status until apps_count is 0
+    Wait for publisher to have no associated apps after removal.
+    Verifies by checking the actual private apps API rather than relying on the
+    publisher's apps_count field, which has eventual consistency issues.
 
     Args:
         publisher_id: Publisher ID to check
         token: Netskope API token
+        context: Lambda context for timeout awareness
         max_wait: Maximum seconds to wait (default: 60)
 
     Returns:
         bool: True if apps cleared, False if timeout
     """
-    logger.info(f'Waiting for publisher {publisher_id} app associations to clear...')
+    logger.info(f"Waiting for publisher {publisher_id} app associations to clear...")
 
-    api_url = f'/api/v2/infrastructure/publishers/{publisher_id}'
+    apps_api_url = "/api/v2/steering/apps/private"
     elapsed = 0
     wait_interval = 3  # Check every 3 seconds
 
     while elapsed < max_wait:
+        remaining = get_remaining_time_ms(context)
+        if remaining is not None and remaining < 15000:
+            logger.warning("Aborting apps-cleared wait - Lambda timeout approaching")
+            return False
+
         try:
-            resp = call_netskope_api_with_retry('get', api_url, token, None, max_retries=2)
+            # Check actual app assignments rather than publisher's apps_count
+            resp = call_netskope_api_with_retry(
+                "get", apps_api_url, token, None, max_retries=2
+            )
 
-            if resp['status'] == 'success' and 'data' in resp:
-                apps_count = resp['data'].get('apps_count', 0)
-                logger.info(f'Publisher apps_count: {apps_count} (elapsed: {elapsed}s)')
+            if resp["status"] == "success":
+                private_apps = resp.get("data", {}).get("private_apps", [])
+                associated_apps = []
+                for app in private_apps:
+                    for pub in app.get("service_publisher_assignments", []):
+                        if pub.get("publisher_id") == publisher_id:
+                            associated_apps.append(app.get("app_name", "unknown"))
+                            break
 
-                if apps_count == 0:
-                    logger.info(f'Publisher app associations cleared after {elapsed} seconds')
+                if not associated_apps:
+                    logger.info(
+                        f"Publisher app associations cleared after {elapsed} seconds"
+                    )
                     return True
 
-                # Still has apps associated - keep waiting
-                logger.info(f'Publisher still has {apps_count} app(s) associated, waiting... ({elapsed}/{max_wait}s)')
+                logger.info(
+                    f"Publisher still in {len(associated_apps)} app(s): "
+                    f"{associated_apps}, waiting... ({elapsed}/{max_wait}s)"
+                )
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+            else:
+                logger.warning(f"Error fetching private apps: {json.dumps(resp)}")
                 time.sleep(wait_interval)
                 elapsed += wait_interval
 
-            else:
-                # If we can't get publisher info, it may have been deleted
-                logger.info('Publisher not found - may have been deleted')
-                return True
-
         except Exception as e:
-            logger.warning(f'Error checking publisher apps_count: {str(e)}')
-            # Continue trying
+            logger.warning(f"Error checking publisher app associations: {e}")
             time.sleep(wait_interval)
             elapsed += wait_interval
 
-    logger.warning(f'Timeout waiting for publisher app associations to clear after {max_wait} seconds')
+    logger.warning(
+        f"Timeout waiting for publisher app associations to clear after {max_wait} seconds"
+    )
     return False
 
 
-def wait_for_instance_running(ec2_client, instance_id, max_wait=120):
+def wait_for_instance_running(ec2_client_ref, instance_id, context=None, max_wait=120):
     """
     Wait for EC2 instance to enter 'running' state
 
     Args:
-        ec2_client: boto3 EC2 client
+        ec2_client_ref: boto3 EC2 client
         instance_id: EC2 instance ID
+        context: Lambda context for timeout awareness
         max_wait: Maximum seconds to wait
 
     Returns:
         True if instance is running, False if timeout
     """
-    logger.info(f'Waiting for instance {instance_id} to enter running state...')
+    logger.info(f"Waiting for instance {instance_id} to enter running state...")
 
     start_time = time.time()
     check_interval = 5
 
     while (time.time() - start_time) < max_wait:
+        remaining = get_remaining_time_ms(context)
+        if remaining is not None and remaining < 30000:
+            logger.warning("Aborting instance wait - Lambda timeout approaching")
+            return False
+
         try:
-            response = ec2_client.describe_instances(InstanceIds=[instance_id])
+            response = ec2_client_ref.describe_instances(InstanceIds=[instance_id])
 
-            if len(response['Reservations']) > 0:
-                instance = response['Reservations'][0]['Instances'][0]
-                state = instance['State']['Name']
+            if len(response["Reservations"]) > 0:
+                instance = response["Reservations"][0]["Instances"][0]
+                state = instance["State"]["Name"]
 
-                logger.info(f'Instance state: {state}')
+                logger.info(f"Instance state: {state}")
 
-                if state == 'running':
+                if state == "running":
                     return True
-                elif state in ['terminated', 'shutting-down', 'stopped', 'stopping']:
-                    logger.error(f'Instance entered unexpected state: {state}')
+                if state in ["terminated", "shutting-down", "stopped", "stopping"]:
+                    logger.error(f"Instance entered unexpected state: {state}")
                     return False
 
         except Exception as e:
-            logger.warning(f'Error checking instance state: {str(e)}')
+            logger.warning(f"Error checking instance state: {e}")
 
         time.sleep(check_interval)
 
-    logger.error(f'Instance did not enter running state within {max_wait} seconds')
+    logger.error(f"Instance did not enter running state within {max_wait} seconds")
     return False
 
 
-def wait_for_command_completion(ssm_client, command_id, instance_id, max_wait=300):
+def wait_for_command_completion(  # pylint: disable=too-many-nested-blocks
+    ssm_client_ref, command_id, instance_id, context=None, max_wait=300
+):
     """
     Wait for SSM command to complete and check status
 
     Args:
-        ssm_client: boto3 SSM client
+        ssm_client_ref: boto3 SSM client
         command_id: SSM command ID
         instance_id: EC2 instance ID
+        context: Lambda context for timeout awareness
         max_wait: Maximum seconds to wait
 
     Returns:
         True if command succeeded, False otherwise
     """
-    logger.info(f'Waiting for command {command_id} to complete...')
+    logger.info(f"Waiting for command {command_id} to complete...")
 
     start_time = time.time()
     check_interval = 5
 
     while (time.time() - start_time) < max_wait:
+        remaining = get_remaining_time_ms(context)
+        if remaining is not None and remaining < 30000:
+            logger.warning("Aborting command wait - Lambda timeout approaching")
+            return False
+
         try:
-            response = ssm_client.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=instance_id
+            response = ssm_client_ref.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id
             )
 
-            status = response['Status']
-            logger.info(f'Command status: {status}')
+            status = response["Status"]
+            logger.info(f"Command status: {status}")
 
             # Terminal states
-            if status == 'Success':
-                logger.info('Command completed with Success status')
-                stdout = response.get('StandardOutputContent', '')
+            if status == "Success":
+                logger.info("Command completed with Success status")
+                stdout = response.get("StandardOutputContent", "")
                 if stdout:
-                    logger.info(f'Standard Output (first 500 chars): {stdout[:500]}')
+                    logger.info(f"Standard Output (first 500 chars): {stdout[:500]}")
 
                     # Check if registration actually succeeded by parsing output
                     # The npa_publisher_wizard command may return 0 exit code even on failure
-                    if 'Registration failed' in stdout or 'Error: Registration' in stdout:
-                        logger.error('Publisher registration failed despite command Success status')
-                        logger.error(f'Full output: {stdout}')
+                    if (
+                        "Registration failed" in stdout
+                        or "Error: Registration" in stdout
+                    ):
+                        logger.error(
+                            "Publisher registration failed despite command Success status"
+                        )
+                        logger.error(f"Full output: {stdout}")
                         return False
 
                     # Additional failure patterns
                     failure_patterns = [
-                        'context deadline exceeded',
-                        'Timeout exceeded',
-                        'admin call didn\'t succeed',
-                        'Please generate a new token'
+                        "context deadline exceeded",
+                        "Timeout exceeded",
+                        "admin call didn't succeed",
+                        "Please generate a new token",
                     ]
 
                     for pattern in failure_patterns:
                         if pattern in stdout:
-                            logger.error(f'Registration failure detected: "{pattern}" found in output')
-                            logger.error(f'Full output: {stdout}')
+                            logger.error(
+                                f'Registration failure detected: "{pattern}" found in output'
+                            )
+                            logger.error(f"Full output: {stdout}")
                             return False
 
-                    logger.info('Publisher registration command completed successfully')
+                    logger.info("Publisher registration command completed successfully")
                 return True
 
-            elif status in ['Failed', 'Cancelled', 'TimedOut']:
-                logger.error(f'Command failed with status: {status}')
-                stderr = response.get('StandardErrorContent', '')
-                stdout = response.get('StandardOutputContent', '')
+            if status in ["Failed", "Cancelled", "TimedOut"]:
+                logger.error(f"Command failed with status: {status}")
+                stderr = response.get("StandardErrorContent", "")
+                stdout = response.get("StandardOutputContent", "")
                 if stderr:
-                    logger.error(f'Standard Error: {stderr}')
+                    logger.error(f"Standard Error: {stderr}")
                 if stdout:
-                    logger.error(f'Standard Output: {stdout}')
+                    logger.error(f"Standard Output: {stdout}")
                 return False
 
             # Still running states: 'Pending', 'InProgress', 'Delayed'
             # Continue waiting
 
-        except ssm_client.exceptions.InvocationDoesNotExist:
-            logger.info('Command invocation not yet available, waiting...')
+        except ssm_client_ref.exceptions.InvocationDoesNotExist:
+            logger.info("Command invocation not yet available, waiting...")
 
         except Exception as e:
-            logger.warning(f'Error checking command status: {str(e)}')
+            logger.warning(f"Error checking command status: {e}")
 
         time.sleep(check_interval)
 
-    logger.error(f'Command did not complete within {max_wait} seconds')
+    logger.error(f"Command did not complete within {max_wait} seconds")
     return False
+
+
+VALID_HTTP_METHODS = {"get", "post", "patch", "put", "delete"}
 
 
 def call_netskope_api(method, api_url, token, req_payload):
@@ -974,43 +1136,56 @@ def call_netskope_api(method, api_url, token, req_payload):
     Returns:
         API response as dict
     """
-    get_url = 'https://' + tenant_fqdn + api_url
-    req_headers = {'Netskope-Api-Token': token, 'accept': "application/json"}
+    if method not in VALID_HTTP_METHODS:
+        raise ValueError(
+            f'Invalid HTTP method: {method}. Must be one of: {", ".join(VALID_HTTP_METHODS)}'
+        )
 
-    logger.info(f'Calling Netskope API: {method.upper()} {api_url}')
+    url = f"https://{tenant_fqdn}{api_url}"
+    headers = {
+        "Netskope-Api-Token": token,
+        "accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    data = json.dumps(req_payload).encode("utf-8") if req_payload else None
 
-    action = getattr(requests, method)
-    r = action(headers=req_headers, json=req_payload, url=get_url)
+    logger.info(f"Calling Netskope API: {method.upper()} {api_url}")
 
-    response = r.json()
-    logger.info(f'API Response: {json.dumps(response)[:200]}...')
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            raise NetskopeAPIError("api_call", f"Server error {e.code}") from e
+        body = e.read().decode("utf-8")
+
+    try:
+        response = json.loads(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise NetskopeAPIError("api_call", f"Invalid JSON: {body[:200]}") from exc
+
+    logger.info(f"API Response: {json.dumps(response)[:200]}...")
 
     return response
 
 
-def get_secret(secret_name):
+def get_secret(param_name):
     """
-    Retrieve secret from AWS Secrets Manager
+    Retrieve secret from AWS Systems Manager Parameter Store
 
     Args:
-        secret_name: Secret ARN or name
+        param_name: SSM parameter name
 
     Returns:
-        Secret value as string
+        Parameter value as string
     """
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager',
-        region_name=AWS_REGION
-    )
-
     try:
-        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        response = ssm_client.get_parameter(Name=param_name, WithDecryption=True)
     except ClientError as e:
-        error_code = e.response['Error']['Code']
-        logger.error(f'Error retrieving secret: {error_code}')
-        raise e
-    else:
-        secret = get_secret_value_response['SecretString']
+        error_code = e.response["Error"]["Code"]
+        logger.error(f"Error retrieving parameter: {error_code}")
+        raise
 
-    return secret
+    return response["Parameter"]["Value"]

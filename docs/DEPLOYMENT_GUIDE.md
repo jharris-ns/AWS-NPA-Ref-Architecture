@@ -9,7 +9,7 @@ Before you begin, ensure you have:
 - **AWS Account with appropriate permissions** - See [IAM Permissions Required](../README.md#iam-permissions-required) in README.md or review [templates/deployment-iam-policy.json](../templates/deployment-iam-policy.json)
 - Amazon VPC with subnet that has internet connectivity (NAT Gateway) - **OR** choose to create new VPC
 - AWS Systems Manager enabled
-- Netskope API v2 Token with infrastructure and application management permissions
+- Netskope REST API v2 Token with infrastructure and application management permissions (create via **Settings → Administration → Administrators & Roles** in Netskope UI; legacy tokens from **Settings → Tools → REST API v2** also work)
 - NPA Publisher AMI ID for your region (see command below)
 - S3 bucket for Lambda deployment package (**must be in same region as deployment**)
 
@@ -40,37 +40,22 @@ Change `--region` to match your deployment region (e.g., `eu-west-1`, `us-west-2
 
 ## Deployment Options
 
-### Option 1: Interactive Deployment Script (Recommended)
+### Option 1: AWS Console (Recommended)
 
-Use the interactive deployment script for guided setup:
+1. Go to [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/)
+2. Click **Create Stack** → **With new resources (standard)**
+3. Select **Upload a template file** and upload `templates/netskope-ref-architecture-npa.yaml`
+4. Enter a **Stack name** (e.g., `netskope-npa-publisher`)
+5. Fill in the parameters — the template groups them into sections with descriptions:
+   - **Netskope tenant info**: Tenant FQDN, API token, token provisioning
+   - **VPC Configuration**: Create new VPC or use existing (VPC ID, subnets)
+   - **Publisher Configuration**: Group name, AMI ID, key pair, instance type, app associations
+   - **Lambda Configuration**: S3 bucket and key for the Lambda deployment package
+   - **Tags**: Cost center, project, environment
+6. On the review page, check **I acknowledge that AWS CloudFormation might create IAM resources with custom names**
+7. Click **Submit**
 
-```bash
-../scripts/deploy.sh my-stack-name my-lambda-bucket
-
-# Follow the interactive prompts:
-# 1. Choose VPC mode (create new or use existing)
-# 2. Provide required parameters based on your choice
-# 3. Confirm and deploy
-```
-
-### Option 2: AWS Console
-
-1. Navigate to CloudFormation in AWS Console
-2. Choose **Create Stack** → **With new resources**
-3. Upload template: `templates/netskope-ref-architecture-npa.yaml`
-4. Fill in parameters:
-   - **Netskope Tenant FQDN**: `mytenant.goskope.com`
-   - **VPC Configuration**: Choose to create new or use existing
-   - **Publisher Group Name**: e.g., `MyNPAPublisher`
-   - **AMI ID**: Get from helper script or AWS CLI
-   - **Key Pair**: Select existing EC2 key pair
-   - **API Token**: Enter Netskope API v2 token
-   - **Lambda S3 Bucket**: Your S3 bucket name (same region as deployment!)
-   - **Lambda S3 Key**: `npa-publisher-lambda.zip`
-5. Acknowledge IAM resource creation
-6. Click **Create Stack**
-
-### Option 3: AWS CLI - Create New VPC
+### Option 2: AWS CLI - Create New VPC
 
 ```bash
 aws cloudformation create-stack \
@@ -94,7 +79,7 @@ aws cloudformation create-stack \
   --region us-east-1
 ```
 
-### Option 4: AWS CLI - Use Existing VPC
+### Option 3: AWS CLI - Use Existing VPC
 
 ```bash
 aws cloudformation create-stack \
@@ -292,7 +277,7 @@ aws s3 rm s3://my-lambda-bucket/npa-publisher-lambda.zip
 - Unassigns publisher from private apps
 - Terminates EC2 instances
 - Deletes VPC resources (if created by stack)
-- Removes Secrets Manager secret
+- Removes SSM parameter
 - Deletes VPC endpoints (if created by stack)
 
 ## Next Steps

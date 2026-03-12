@@ -3,12 +3,14 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: "NPA Publisher Dual Instance Multi-AZ (No Auto Scaling) 2.0 - Deploys two NPA Publishers across two availability zones for redundancy"
 
 Metadata:
-  cfnlint:
+  cfn-lint:
     config:
       ignore_checks:
         - W3002
         - W2001
         - E3030
+        - E3002  # MetadataOptions is valid on AWS::EC2::Instance but not in cfn-lint's spec
+        - E3510  # ExistingNetskopeAPITokenParam default is empty; only used when ProvisionNewAPIToken=no
   AWS::CloudFormation::Interface:
     ParameterGroups:
       -
@@ -39,6 +41,7 @@ Metadata:
           default: "Netskope NPA Publisher info"
         Parameters:
           - NPAPublisherGroupName
+          - AppAssociations
           - NPAPublisherAMIId
           - NPAPublisherKey
           - NPAPublisherInstanceType
@@ -60,17 +63,19 @@ Metadata:
       NetskopeTenantFQDN:
         default: Netskope tenant FQDN, for example mytenant.goskope.com
       ProvisionNewAPIToken:
-        default: Choose if you'd like to create a new SSM Parameter Store parameter for Netskope API token or to use an existing one
+        default: Choose if you'd like to create a new SSM parameter for Netskope API token or use an existing one
       ExistingNetskopeAPITokenParam:
-        default: If you're using an existing SSM Parameter Store parameter for Netskope API token enter its name here
+        default: If you're using an existing SSM parameter for the Netskope API token, enter the parameter name here
       NetskopeAPIToken:
-        default: Netskope API v2 token if you're creating a new parameter in SSM Parameter Store
+        default: Netskope API v2 token if you're creating a new SSM parameter
       VPC:
         default: VPC id where you'd like your NPA publisher to be deployed
       NPAPublisherSubnet:
         default: Select Private Subnet with internet connectivity via NAT Gateway
       NPAPublisherGroupName:
         default: NPA Publisher Group Name
+      AppAssociations:
+        default: "Private apps to associate with publishers (None, All, or comma-separated app names)"
       NPAPublisherAMIId:
         default: NPA publisher AMI id
       NPAPublisherKey:
@@ -92,12 +97,17 @@ Metadata:
 
 Parameters:
   NPAPublisherGroupName:
-    Description: 'The NPA publisher group name. All private applications names served by this publisher should start with this value'
+    Description: 'The NPA publisher group name used for naming publishers and resources'
     Type: String
     MinLength: 3
     MaxLength: 64
     AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
     ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  AppAssociations:
+    Description: 'Private apps to associate with publishers. Use "None" to skip, "All" for all apps, or a comma-separated list of app names'
+    Type: String
+    Default: 'None'
 
   NPAPublisherAMIId:
     Description: 'NPA publisher AMI id'
@@ -191,7 +201,7 @@ Parameters:
 
   ProvisionNewAPIToken:
     Default: 'yes'
-    Description: 'Provision new Netskope API v2 token in SSM Parameter Store?'
+    Description: 'Provision new SSM parameter for Netskope API v2 token?'
     AllowedValues:
       - 'yes'
       - 'no'
@@ -200,11 +210,11 @@ Parameters:
   NetskopeAPIToken:
     NoEcho: true
     Default: ""
-    Description: 'If new Netskope API v2 token has to be provisioned in SSM Parameter Store, enter it here'
+    Description: 'If a new SSM parameter is being created, enter the Netskope API v2 token here'
     Type: String
 
   ExistingNetskopeAPITokenParam:
-    Description: 'If an existing SSM parameter for Netskope API v2 token will be used, enter the parameter name here (e.g., /netskope/api-token). For production, use a SecureString parameter created via CLI.'
+    Description: 'If using an existing SSM parameter, enter the parameter name here (e.g., /netskope/api-token). For production, use a SecureString parameter created via CLI.'
     Type: 'String'
     Default: ''
 
@@ -283,6 +293,180 @@ Mappings:
       S3Prefix: "NPAPublisherAutoscalling"
 
 Resources:
+  # ================================================================
+  # NPA PUBLISHER INSTANCES
+  # ================================================================
+  #
+  # Each publisher requires two resources:
+  #   1. An EC2 Instance     - the publisher VM
+  #   2. A Custom Resource   - registers the publisher with Netskope
+  #
+  # SCALING UP — To add a publisher:
+  #   1. Copy an entire "Publisher N" block below (Instance + Registration)
+  #   2. Change all resource names: increment the suffix number
+  #      e.g. NPAPublisherInstance2 -> NPAPublisherInstance3
+  #           NPAPublisherRegistration2 -> NPAPublisherRegistration3
+  #   3. Update DependsOn in the Registration to include BOTH:
+  #      - The new Instance name (e.g. NPAPublisherInstance3)
+  #      - The PREVIOUS Registration (e.g. NPAPublisherRegistration2)
+  #      This serializes registrations to prevent race conditions when
+  #      multiple publishers write to the same app definitions.
+  #   4. Set SubnetId to the desired subnet:
+  #      - New VPC:      use !Ref PrivateSubnet or !Ref PrivateSubnet2
+  #      - Existing VPC: use !Ref ExistingPrivateSubnet or ExistingPrivateSubnet2
+  #      For a third AZ, add a new subnet parameter and reference it here
+  #   5. Update the Name tag to a unique value (e.g. ${NPAPublisherGroupName}-3)
+  #   6. Add matching Outputs at the bottom of the template
+  #   7. Run: aws cloudformation update-stack ...
+  #
+  # SCALING DOWN — To remove a publisher:
+  #   1. Delete the publisher's Instance + Registration block
+  #   2. Update the DependsOn chain if removing a publisher in the middle
+  #      (e.g. if removing Publisher 2 of 3, point Publisher 3's Registration
+  #      DependsOn to Publisher 1's Registration instead)
+  #   3. Delete the matching Outputs
+  #   4. Run: aws cloudformation update-stack ...
+  #      CloudFormation will trigger the Custom Resource DELETE, which
+  #      deregisters the publisher from Netskope automatically.
+  #
+  # ================================================================
+
+  # ---------------------------------------------------------------
+  # Publisher 1 — AZ1 (PrivateSubnet / ExistingPrivateSubnet)
+  # ---------------------------------------------------------------
+  NPAPublisherInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref NPAPublisherAMIId
+      InstanceType: !Ref NPAPublisherInstanceType
+      KeyName: !Ref NPAPublisherKey
+      IamInstanceProfile: !Ref NPAPublisherInstanceProfile
+      SecurityGroupIds:
+        - !Ref NPAPublisherSecurityGroup
+      SubnetId:
+        Fn::If:
+          - CreateVPC
+          - !Ref PrivateSubnet
+          - !Ref ExistingPrivateSubnet
+      Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        !If
+          - EnableCloudWatchMonitoring
+          - Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Install CloudWatch agent
+              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+              dpkg -i -E ./amazon-cloudwatch-agent.deb
+              rm amazon-cloudwatch-agent.deb
+
+              # Fetch configuration from SSM Parameter and start agent
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config \
+                -m ec2 \
+                -s \
+                -c ssm:${CloudWatchAgentConfig}
+
+              echo "CloudWatch agent installed and configured"
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Ref NPAPublisherGroupName
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: aws-apn-id
+          Value: 2477fb49-b2ca-409e-9b2b-87322e6008c2
+
+  NPAPublisherRegistration:
+    Type: Custom::NPAPublisher
+    DependsOn: NPAPublisherInstance
+    Properties:
+      ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
+      InstanceId: !Ref NPAPublisherInstance
+      PublisherNamePrefix: !Ref NPAPublisherGroupName
+      AppAssociations: !Ref AppAssociations
+      AccountId: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------
+  # Publisher 2 — AZ2 (PrivateSubnet2 / ExistingPrivateSubnet2)
+  # ---------------------------------------------------------------
+  NPAPublisherInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref NPAPublisherAMIId
+      InstanceType: !Ref NPAPublisherInstanceType
+      KeyName: !Ref NPAPublisherKey
+      IamInstanceProfile: !Ref NPAPublisherInstanceProfile
+      SecurityGroupIds:
+        - !Ref NPAPublisherSecurityGroup
+      SubnetId:
+        Fn::If:
+          - CreateVPC
+          - !Ref PrivateSubnet2
+          - !Ref ExistingPrivateSubnet2
+      Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        !If
+          - EnableCloudWatchMonitoring
+          - Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Install CloudWatch agent
+              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+              dpkg -i -E ./amazon-cloudwatch-agent.deb
+              rm amazon-cloudwatch-agent.deb
+
+              # Fetch configuration from SSM Parameter and start agent
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config \
+                -m ec2 \
+                -s \
+                -c ssm:${CloudWatchAgentConfig}
+
+              echo "CloudWatch agent installed and configured"
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-2'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: aws-apn-id
+          Value: 2477fb49-b2ca-409e-9b2b-87322e6008c2
+
+  NPAPublisherRegistration2:
+    Type: Custom::NPAPublisher
+    DependsOn:
+      - NPAPublisherInstance2
+      - NPAPublisherRegistration
+    Properties:
+      ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
+      InstanceId: !Ref NPAPublisherInstance2
+      PublisherNamePrefix: !Ref NPAPublisherGroupName
+      AppAssociations: !Ref AppAssociations
+      AccountId: !Ref AWS::AccountId
+
+  # ==============================================================
+  # SHARED INFRASTRUCTURE (no changes needed for scaling)
+  # ==============================================================
+
   # ==============================================================
   # VPC Resources (Conditional - only created if CreateNewVPC=yes)
   # ==============================================================
@@ -582,13 +766,13 @@ Resources:
   # This creates a String parameter. For production, pre-create the parameter
   # as SecureString via CLI and use ProvisionNewAPIToken=no:
   #   aws ssm put-parameter --name /netskope/api-token --type SecureString --value "YOUR_TOKEN"
-  APITokenParameter:
+  APISecret:
     Type: 'AWS::SSM::Parameter'
     Condition: ToProvisionNewAPIToken
     Properties:
       Name: !Sub '${AWS::StackName}-netskope-api-token'
       Type: String
-      Description: Netskope API v2 token
+      Description: Netskope API v2 token (use SecureString for production - see comments above)
       Value: !Ref NetskopeAPIToken
       Tags:
         CostCenter: !Ref CostCenterTag
@@ -741,16 +925,15 @@ Resources:
                   - "logs:PutLogEvents"
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${NPAPublisherGroupName}-RegistrationHandler:*'
-              - Sid: SecretsManagerAccess
+              - Sid: SSMParameterAccess
                 Effect: Allow
                 Action:
-                  - 'secretsmanager:GetSecretValue'
-                  - 'secretsmanager:DescribeSecret'
+                  - 'ssm:GetParameter'
                 Resource:
                   'Fn::If':
                     - ToProvisionNewAPIToken
-                    - !Ref APISecret
-                    - !Ref ExistingNetskopeAPITokenARN
+                    - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${APISecret}'
+                    - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ExistingNetskopeAPITokenParam}'
               - Sid: SSMSendCommandToPublisherInstances
                 Effect: Allow
                 Action:
@@ -979,114 +1162,7 @@ Resources:
       Description: "AWS Systems Manager via VPC Endpoints"
 
   # ==============================================================
-  # EC2 Instance
-  # ==============================================================
-  NPAPublisherInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref NPAPublisherAMIId
-      InstanceType: !Ref NPAPublisherInstanceType
-      KeyName: !Ref NPAPublisherKey
-      IamInstanceProfile: !Ref NPAPublisherInstanceProfile
-      SecurityGroupIds:
-        - !Ref NPAPublisherSecurityGroup
-      SubnetId:
-        Fn::If:
-          - CreateVPC
-          - !Ref PrivateSubnet
-          - !Ref ExistingPrivateSubnet
-      Monitoring: true
-      MetadataOptions:
-        HttpTokens: required
-        HttpEndpoint: enabled
-        HttpPutResponseHopLimit: 2
-      UserData:
-        !If
-          - EnableCloudWatchMonitoring
-          - Fn::Base64: !Sub |
-              #!/bin/bash
-              set -e
-
-              # Install CloudWatch agent
-              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-              dpkg -i -E ./amazon-cloudwatch-agent.deb
-              rm amazon-cloudwatch-agent.deb
-
-              # Fetch configuration from SSM Parameter and start agent
-              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-                -a fetch-config \
-                -m ec2 \
-                -s \
-                -c ssm:${CloudWatchAgentConfig}
-
-              echo "CloudWatch agent installed and configured"
-          - !Ref AWS::NoValue
-      Tags:
-        - Key: Name
-          Value: !Ref NPAPublisherGroupName
-        - Key: CostCenter
-          Value: !Ref CostCenterTag
-        - Key: Project
-          Value: !Ref ProjectTag
-        - Key: Environment
-          Value: !Ref EnvironmentTag
-        - Key: aws-apn-id
-          Value: 2477fb49-b2ca-409e-9b2b-87322e6008c2
-
-  NPAPublisherInstance2:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref NPAPublisherAMIId
-      InstanceType: !Ref NPAPublisherInstanceType
-      KeyName: !Ref NPAPublisherKey
-      IamInstanceProfile: !Ref NPAPublisherInstanceProfile
-      SecurityGroupIds:
-        - !Ref NPAPublisherSecurityGroup
-      SubnetId:
-        Fn::If:
-          - CreateVPC
-          - !Ref PrivateSubnet2
-          - !Ref ExistingPrivateSubnet2
-      Monitoring: true
-      MetadataOptions:
-        HttpTokens: required
-        HttpEndpoint: enabled
-        HttpPutResponseHopLimit: 2
-      UserData:
-        !If
-          - EnableCloudWatchMonitoring
-          - Fn::Base64: !Sub |
-              #!/bin/bash
-              set -e
-
-              # Install CloudWatch agent
-              wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-              dpkg -i -E ./amazon-cloudwatch-agent.deb
-              rm amazon-cloudwatch-agent.deb
-
-              # Fetch configuration from SSM Parameter and start agent
-              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-                -a fetch-config \
-                -m ec2 \
-                -s \
-                -c ssm:${CloudWatchAgentConfig}
-
-              echo "CloudWatch agent installed and configured"
-          - !Ref AWS::NoValue
-      Tags:
-        - Key: Name
-          Value: !Sub '${NPAPublisherGroupName}-2'
-        - Key: CostCenter
-          Value: !Ref CostCenterTag
-        - Key: Project
-          Value: !Ref ProjectTag
-        - Key: Environment
-          Value: !Ref EnvironmentTag
-        - Key: aws-apn-id
-          Value: 2477fb49-b2ca-409e-9b2b-87322e6008c2
-
-  # ==============================================================
-  # Lambda Function
+  # Lambda Function (shared by all publisher registrations)
   # ==============================================================
   NPAPublisherRegistrationFunction:
     Type: 'AWS::Lambda::Function'
@@ -1121,7 +1197,7 @@ Resources:
             'Fn::If':
               - ToProvisionNewAPIToken
               - !Ref APISecret
-              - !Ref ExistingNetskopeAPITokenARN
+              - !Ref ExistingNetskopeAPITokenParam
           LOGLEVEL: 'INFO'
           EC2_READY_TIMEOUT: '120'
           SSM_READY_TIMEOUT: '240'
@@ -1140,40 +1216,10 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentTag
 
-  # ==============================================================
-  # Custom Resource for Publisher Registration
-  # ==============================================================
-  NPAPublisherRegistration:
-    Type: Custom::NPAPublisher
-    DependsOn: NPAPublisherInstance
-    Properties:
-      ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
-      InstanceId: !Ref NPAPublisherInstance
-      PublisherGroupName: !Ref NPAPublisherGroupName
-      AccountId: !Ref AWS::AccountId
-
-  NPAPublisherRegistration2:
-    Type: Custom::NPAPublisher
-    DependsOn: NPAPublisherInstance2
-    Properties:
-      ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
-      InstanceId: !Ref NPAPublisherInstance2
-      PublisherGroupName: !Ref NPAPublisherGroupName
-      AccountId: !Ref AWS::AccountId
-
 Outputs:
-  PublisherInstanceId:
-    Description: EC2 Instance ID of the NPA Publisher
-    Value: !Ref NPAPublisherInstance
-    Export:
-      Name: !Sub '${AWS::StackName}-InstanceId'
-
-  PublisherPrivateIP:
-    Description: Private IP address of the NPA Publisher
-    Value: !GetAtt NPAPublisherInstance.PrivateIp
-    Export:
-      Name: !Sub '${AWS::StackName}-PrivateIP'
-
+  # ==============================================================
+  # Shared Infrastructure Outputs
+  # ==============================================================
   PublisherSecurityGroup:
     Description: Security Group ID for the NPA Publisher
     Value: !Ref NPAPublisherSecurityGroup
@@ -1226,18 +1272,6 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-NATGateway'
 
-  PublisherInstanceId2:
-    Description: EC2 Instance ID of the second NPA Publisher
-    Value: !Ref NPAPublisherInstance2
-    Export:
-      Name: !Sub '${AWS::StackName}-InstanceId2'
-
-  PublisherPrivateIP2:
-    Description: Private IP address of the second NPA Publisher
-    Value: !GetAtt NPAPublisherInstance2.PrivateIp
-    Export:
-      Name: !Sub '${AWS::StackName}-PrivateIP2'
-
   PublicSubnetId2:
     Condition: CreateVPC
     Description: Second Public Subnet ID (created by this stack)
@@ -1258,3 +1292,34 @@ Outputs:
     Value: !Ref NATGateway2
     Export:
       Name: !Sub '${AWS::StackName}-NATGateway2'
+
+  # ==============================================================
+  # Publisher Outputs
+  # ==============================================================
+  # When adding/removing publishers, add/remove matching outputs here.
+
+  # Publisher 1
+  PublisherInstanceId:
+    Description: EC2 Instance ID of NPA Publisher 1
+    Value: !Ref NPAPublisherInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  PublisherPrivateIP:
+    Description: Private IP address of NPA Publisher 1
+    Value: !GetAtt NPAPublisherInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+
+  # Publisher 2
+  PublisherInstanceId2:
+    Description: EC2 Instance ID of NPA Publisher 2
+    Value: !Ref NPAPublisherInstance2
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId2'
+
+  PublisherPrivateIP2:
+    Description: Private IP address of NPA Publisher 2
+    Value: !GetAtt NPAPublisherInstance2.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP2'

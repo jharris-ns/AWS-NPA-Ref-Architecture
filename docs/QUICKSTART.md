@@ -7,7 +7,7 @@ Get your Netskope Private Access Publisher deployed with multi-AZ redundancy in 
 Before you begin, ensure you have:
 
 - [ ] AWS Account with CloudFormation permissions
-- [ ] Netskope API v2 Token ([generate here](https://docs.netskope.com/en/rest-api-v2-overview-312207.html))
+- [ ] Netskope REST API v2 Token (create an admin service account in **Settings → Administration → Administrators & Roles** — see [Netskope docs](https://docs.netskope.com/en/netskope-help/admin/administration/service-accounts/) for details)
 - [ ] NPA Publisher AMI ID for your region (see command below)
 - [ ] EC2 Key Pair in target region
 - [ ] S3 bucket for Lambda deployment package (must be in same region as deployment)
@@ -96,27 +96,17 @@ aws s3 cp scripts/npa-publisher-lambda.zip s3://my-npa-lambda-bucket/
 
 ### Step 2: Deploy CloudFormation Stack
 
-**Option A: Interactive Deployment (Recommended)**
+**Option A: AWS Console (Recommended)**
 
-```bash
-../scripts/deploy.sh my-stack-name my-npa-lambda-bucket
+1. Go to [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/)
+2. Click **Create Stack** → **With new resources (standard)**
+3. Select **Upload a template file** and upload `templates/netskope-ref-architecture-npa.yaml`
+4. Enter a **Stack name** (e.g., `netskope-npa-publisher`)
+5. Fill in the parameters — the template groups them by section with descriptions for each field (see [Parameter Reference](#parameter-reference) below)
+6. On the review page, check **I acknowledge that AWS CloudFormation might create IAM resources with custom names**
+7. Click **Submit**
 
-# Follow the interactive prompts:
-# 1. Choose VPC mode (create new or use existing)
-# 2. Provide required parameters based on your choice
-# 3. Confirm and deploy
-```
-
-**Option B: AWS Console**
-
-1. Go to AWS CloudFormation Console
-2. Click **Create Stack** → **With new resources**
-3. Upload `templates/netskope-ref-architecture-npa.yaml`
-4. Fill in the parameters (see below)
-5. Check **I acknowledge that AWS CloudFormation might create IAM resources**
-6. Click **Create Stack**
-
-**Option C: AWS CLI - New VPC**
+**Option B: AWS CLI - New VPC**
 
 ```bash
 aws cloudformation create-stack \
@@ -138,7 +128,7 @@ aws cloudformation create-stack \
   --region us-east-1
 ```
 
-**Option D: AWS CLI - Existing VPC**
+**Option C: AWS CLI - Existing VPC**
 
 ```bash
 aws cloudformation create-stack \
@@ -157,6 +147,17 @@ aws cloudformation create-stack \
     ParameterKey=LambdaS3Key,ParameterValue=npa-publisher-lambda.zip \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1
+```
+
+**Option D: Interactive Deployment Script**
+
+```bash
+../scripts/deploy.sh my-stack-name my-npa-lambda-bucket
+
+# Follow the interactive prompts:
+# 1. Choose VPC mode (create new or use existing)
+# 2. Provide required parameters based on your choice
+# 3. Confirm and deploy
 ```
 
 ### Step 3: Monitor Deployment
@@ -219,7 +220,7 @@ aws cloudformation describe-stacks \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `NPAPublisherInstanceType` | EC2 instance type | `t3.large` |
-| `ProvisionNewAPIToken` | Store API token in Secrets Manager | `yes` |
+| `ProvisionNewAPIToken` | Store API token in SSM Parameter Store | `yes` |
 
 ## Deployment Timeline
 
@@ -231,7 +232,7 @@ t=0m    CloudFormation: CREATE_IN_PROGRESS
         ├─ VPC resources created (if new VPC, 1 AZ)
         ├─ Security group created
         ├─ IAM role created
-        └─ Secrets Manager secret created
+        └─ SSM parameter created
 
 t=1m    EC2 instance launched (AZ1)
         └─ SSM Agent starts
@@ -265,7 +266,7 @@ t=0m    CloudFormation: CREATE_IN_PROGRESS
         ├─ NAT Gateways x2 created
         ├─ Security group created
         ├─ IAM role created
-        └─ Secrets Manager secret created
+        └─ SSM parameter created
 
 t=1m    EC2 instances launched (AZ1 + AZ2)
         └─ SSM Agents start
@@ -368,7 +369,7 @@ aws logs tail /aws/lambda/MyPublisher-RegistrationHandler --follow
 ```
 
 **Common issues:**
-- API token invalid → Check token in Secrets Manager
+- API token invalid → Check token in SSM Parameter Store
 - SSM agent not starting → Check security group, NAT Gateway
 - Command timeout → Check instance has internet access
 
@@ -417,11 +418,13 @@ sudo /home/ubuntu/npa_publisher_wizard -token "test"
 
 **Test token manually:**
 ```bash
-# Get token from Secrets Manager
-TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id NetskopeAPIToken-MyPublisher \
-  --query SecretString \
-  --output text | jq -r '.NetskopeAPIToken')
+# Get token from SSM Parameter Store
+STACK_NAME="netskope-npa-publisher"
+TOKEN=$(aws ssm get-parameter \
+  --name "${STACK_NAME}-netskope-api-token" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text)
 
 # Test API call
 curl -H "Netskope-Api-Token: $TOKEN" \
@@ -449,7 +452,7 @@ aws s3 rm s3://my-lambda-bucket/npa-publisher-lambda.zip
 - Unassigns publisher from private apps
 - Terminates EC2 instance
 - Deletes VPC resources (if created by stack)
-- Removes Secrets Manager secret
+- Removes SSM parameter
 
 ## Security Features
 
@@ -460,7 +463,7 @@ This deployment includes enterprise-grade security controls:
 - ✅ **VPC Endpoints** - Systems Manager traffic stays within AWS network (3 endpoints: ssm, ec2messages, ssmmessages)
 - ✅ **Private Subnets** - No public IPs assigned to publishers
 - ✅ **NAT Gateways** - Dedicated per AZ for redundant Netskope connectivity
-- ✅ **Secrets Manager** - API token encrypted at rest
+- ✅ **SSM Parameter Store** - API token stored securely (supports SecureString encryption)
 - ✅ **No SSH Keys Required** - Use AWS Systems Manager Session Manager
 - ✅ **No Secrets in User Data** - Registration token passed via SSM command
 

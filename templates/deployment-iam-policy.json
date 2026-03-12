@@ -135,17 +135,16 @@
       "Resource": "arn:aws:lambda:*:*:function:*RegistrationHandler*"
     },
     {
-      "Sid": "SecretsManagerPermissions",
+      "Sid": "SSMParameterPermissions",
       "Effect": "Allow",
       "Action": [
-        "secretsmanager:CreateSecret",
-        "secretsmanager:DeleteSecret",
-        "secretsmanager:DescribeSecret",
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:PutSecretValue",
-        "secretsmanager:TagResource"
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:AddTagsToResource"
       ],
-      "Resource": "arn:aws:secretsmanager:*:*:secret:NetskopeAPIToken-*"
+      "Resource": "arn:aws:ssm:*:*:parameter/*-netskope-api-token"
     },
     {
       "Sid": "S3LambdaCodePermissions",
