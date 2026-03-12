@@ -2,12 +2,28 @@
 
 Get your Netskope Private Access Publisher deployed with multi-AZ redundancy in under 10 minutes.
 
+## Table of Contents
+
+- [Prerequisites Checklist](#prerequisites-checklist)
+- [Get NPA Publisher AMI ID](#get-npa-publisher-ami-id)
+- [Quick Deploy (3 Steps)](#quick-deploy-3-steps)
+- [Parameter Reference](#parameter-reference)
+- [Deployment Timeline](#deployment-timeline)
+- [Verify Deployment](#verify-deployment)
+- [Private App Associations](#private-app-associations)
+- [Troubleshooting](#troubleshooting)
+- [Clean Up](#clean-up)
+- [Security Features](#security-features)
+- [Next Steps](#next-steps)
+- [Additional Resources](#additional-resources)
+- [Getting Help](#getting-help)
+
 ## Prerequisites Checklist
 
 Before you begin, ensure you have:
 
 - [ ] AWS Account with CloudFormation permissions
-- [ ] Netskope REST API v2 Token (create an admin service account in **Settings → Administration → Administrators & Roles** — see [Netskope docs](https://docs.netskope.com/en/netskope-help/admin/administration/service-accounts/) for details)
+- [ ] Netskope REST API v2 Token (create an admin service account in **Settings → Administration → Administrators & Roles** — see [Netskope docs](https://docs.netskope.com/en/administration) for details)
 - [ ] NPA Publisher AMI ID for your region (see command below)
 - [ ] EC2 Key Pair in target region
 - [ ] S3 bucket for Lambda deployment package (must be in same region as deployment)
@@ -332,106 +348,33 @@ aws ssm start-session --target $INSTANCE_ID
 systemctl status npa_publisher
 ```
 
-## Create Private Applications
+## Private App Associations
 
-After deployment, create private applications in Netskope:
+The `AppAssociations` parameter controls which existing private apps the publisher is assigned to during deployment:
 
-**IMPORTANT**: App names must start with your Publisher Group Name.
+| Value | Behaviour |
+|-------|-----------|
+| `None` (default) | Skip — no apps are assigned. Assign manually in the Netskope UI after deployment. |
+| `All` | Assign the publisher to **every** existing private app in the tenant. |
+| `App1,App2` | Comma-separated list of exact app names to assign. |
 
 ```
-Publisher Group Name: MyPublisher
-
-✅ Valid App Names:
-  - MyPublisher-InternalApp
-  - MyPublisher-WebServer
-  - MyPublisher-Database
-
-❌ Invalid App Names:
-  - InternalApp
-  - Web-MyPublisher
-  - MyApp
+Examples:
+  AppAssociations = None           → no automatic assignment
+  AppAssociations = All            → assigned to all private apps
+  AppAssociations = SSH,WebPortal  → assigned to "SSH" and "WebPortal" only
 ```
 
 **How it works:**
-- During stack creation, the Lambda function **automatically discovers and assigns** the publisher to all existing apps matching this naming convention
-- Apps can be created before or after deployment - the initial deployment will assign publishers to all matching apps
+- During stack creation, the Lambda function queries existing private apps and assigns the publisher to matching apps
+- App names are matched exactly (case-sensitive) against the names shown in the Netskope UI
 - On stack deletion, the Lambda function automatically removes the publisher from all associated apps
 
-**Note:** If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI.
+**Note:** If you create new apps after deployment, assign publishers manually in the Netskope UI under **Settings → Security Cloud Platform → App Definition**.
 
 ## Troubleshooting
 
-### Stack Stuck at CREATE_IN_PROGRESS
-
-**Check Lambda logs:**
-```bash
-aws logs tail /aws/lambda/MyPublisher-RegistrationHandler --follow
-```
-
-**Common issues:**
-- API token invalid → Check token in SSM Parameter Store
-- SSM agent not starting → Check security group, NAT Gateway
-- Command timeout → Check instance has internet access
-
-### Instance Not Appearing in SSM
-
-**Diagnose:**
-```bash
-# Check if instance is running
-aws ec2 describe-instances --instance-ids $INSTANCE_ID
-
-# Check SSM registration
-aws ssm describe-instance-information \
-  --filters "Key=InstanceIds,Values=$INSTANCE_ID"
-```
-
-**Common causes:**
-- Security group blocks HTTPS (443) outbound
-- No route to internet (NAT Gateway missing)
-- IAM instance profile missing SSM policy
-
-### Command Failed
-
-**View command output:**
-```bash
-# Get command ID from Lambda logs, then:
-aws ssm get-command-invocation \
-  --command-id <command-id> \
-  --instance-id $INSTANCE_ID \
-  --query '[StandardOutputContent,StandardErrorContent]' \
-  --output text
-```
-
-**Connect to instance and debug:**
-```bash
-# Start Session Manager session
-aws ssm start-session --target $INSTANCE_ID
-
-# Check wizard logs
-sudo tail -f /var/log/amazon/ssm/amazon-ssm-agent.log
-
-# Manually run wizard (test mode)
-sudo /home/ubuntu/npa_publisher_wizard -token "test"
-```
-
-### API Token Issues
-
-**Test token manually:**
-```bash
-# Get token from SSM Parameter Store
-STACK_NAME="netskope-npa-publisher"
-TOKEN=$(aws ssm get-parameter \
-  --name "${STACK_NAME}-netskope-api-token" \
-  --with-decryption \
-  --query Parameter.Value \
-  --output text)
-
-# Test API call
-curl -H "Netskope-Api-Token: $TOKEN" \
-     https://mytenant.goskope.com/api/v2/infrastructure/publishers
-```
-
-**Expected response:** JSON with publishers list
+If you encounter issues during deployment, see the [Troubleshooting Guide](TROUBLESHOOTING.md) for detailed diagnostics and solutions.
 
 ## Clean Up
 
@@ -476,8 +419,8 @@ This deployment includes enterprise-grade security controls:
    - Monitor CloudWatch metrics for instance health
 
 2. **Create Private Applications**
-   - Name them: `<PublisherGroupName>-<AppName>`
-   - They'll automatically use this publisher
+   - Create apps in the Netskope UI and assign publishers manually, or
+   - Redeploy with `AppAssociations` set to the app names
 
 3. **Set Up Monitoring**
    - Create CloudWatch alarms for instance health

@@ -864,7 +864,7 @@ systemctl status npa_publisher
 
 **Netskope Documentation:**
 - [REST API v2 Overview](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
-- [Publishers API](https://docs.netskope.com/en/netskope-help/integrations-439794/netskope-api-integration-365842/rest-api-v2-overview-312207/infrastructure-api/)
+- [Publishers API](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
 
 **Best Practices:**
 - [Lambda Best Practices](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html)

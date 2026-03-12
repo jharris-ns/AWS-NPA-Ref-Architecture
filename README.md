@@ -222,15 +222,13 @@ For more information on configuring network segment discovery, see [Netskope doc
 5. **Lambda polls SSM** with exponential backoff until instance is online (up to 4 minutes)
 6. **Lambda sends SSM command** to run `npa_publisher_wizard` with token
 7. **Lambda waits for command completion** (up to 5 minutes)
-8. **Lambda automatically assigns publisher** to private apps matching the naming convention (apps containing the Publisher Group Name)
+8. **Lambda assigns publisher to private apps** based on the `AppAssociations` parameter (`None`, `All`, or a comma-separated list of app names)
 9. **Custom Resource returns SUCCESS** to CloudFormation
-
-**Note:** Private applications can be created before or after deployment. The Lambda function will automatically find and assign the publisher to any apps whose names contain the Publisher Group Name.
 
 ### On Stack Deletion (DELETE)
 
 1. **Custom Resource triggers Lambda** for cleanup
-2. **Lambda automatically removes publisher** from all private applications (matching naming convention)
+2. **Lambda removes publisher** from all associated private applications
 3. **Lambda deletes publisher** from Netskope
 4. **Custom Resource returns SUCCESS**
 5. **CloudFormation deletes EC2 instance**
@@ -385,28 +383,17 @@ Approximate monthly costs for us-east-1 region:
 - Fixed capacity per AZ (monitor usage and scale manually if needed)
 - Instance failures require stack re-creation (automated via CloudFormation)
 
-## Naming Convention for Private Applications
+## Private App Associations
 
-**CRITICAL**: After deployment, create private applications in Netskope with names that **start with your Publisher Group Name**.
+The `AppAssociations` CloudFormation parameter controls which existing private apps are assigned to the publisher during deployment:
 
-**Example:**
-```
-Publisher Group Name: MyPublisher
+| Value | Behaviour |
+|-------|-----------|
+| `None` (default) | No automatic assignment — assign publishers manually in the Netskope UI |
+| `All` | Assign the publisher to every existing private app in the tenant |
+| `App1,App2` | Comma-separated list of exact app names to assign |
 
-✅ Valid App Names:
-  - MyPublisher-InternalApp
-  - MyPublisher-WebServer
-  - MyPublisher-Database
-
-❌ Invalid App Names:
-  - InternalApp
-  - Web-MyPublisher
-  - MyApp
-```
-
-**Why this matters:** The Lambda function automatically assigns the publisher to apps matching this naming convention. Apps that don't follow this pattern will not be automatically associated with your publisher.
-
-**Note:** Apps can be created before or after deployment. During stack creation, the Lambda function automatically discovers and assigns the publisher to all existing apps matching the naming convention. If you create new apps after deployment, you'll need to manually assign the publisher in the Netskope UI.
+App names are matched exactly (case-sensitive) against the names shown in the Netskope UI. If you create new apps after deployment, assign publishers manually under **Settings → Security Cloud Platform → App Definition**.
 
 ## Additional Resources
 
