@@ -8,12 +8,13 @@ This document explains the technical implementation details of the NPA Publisher
 
 - [AWS Systems Manager Usage](#aws-systems-manager-usage)
 - [Lambda Function Architecture](#lambda-function-architecture)
+  - [Scaling to Additional Availability Zones](#scaling-to-additional-availability-zones)
   - [Private App Publisher Assignment](#private-app-publisher-assignment)
 - [Integration Flow](#integration-flow)
 - [Error Handling & Retries](#error-handling--retries)
 - [Timer & Polling Architecture](#timer--polling-architecture)
 - [Security Considerations](#security-considerations)
-- [Troubleshooting Guide](#troubleshooting-guide)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -303,6 +304,52 @@ Uses `remove_publisher_from_apps()` — see [Private App Publisher Assignment](#
 ```
 
 See [OPERATIONS.md](OPERATIONS.md#publisher-deletion-workflow) for the operator-facing view of this workflow.
+
+---
+
+### Scaling to Additional Availability Zones
+
+The template ships with two publishers across two AZs. Adding a third (or Nth) publisher in a new AZ requires changes in several sections of the template. The inline comments in the template cover the publisher-specific steps; this section covers the full picture including the VPC infrastructure that a new AZ requires.
+
+#### Publisher Resources (covered in template comments)
+
+1. Copy an entire Publisher block (Instance + Registration)
+2. Increment all resource name suffixes (e.g., `NPAPublisherInstance3`, `NPAPublisherRegistration3`)
+3. Update `DependsOn` in the Registration to chain to the **previous** Registration (e.g., `NPAPublisherRegistration2`) — this serializes registrations to prevent the race condition described in [The Race Condition](#the-race-condition)
+4. Set `SubnetId` to reference the new AZ's subnet (e.g., `PrivateSubnet3` / `ExistingPrivateSubnet3`)
+5. Update the `Name` tag (e.g., `${NPAPublisherGroupName}-3`)
+6. Add matching Outputs at the bottom of the template
+
+#### New AZ Infrastructure (not covered in template comments)
+
+Adding a publisher in a **new** AZ (beyond the existing two) also requires:
+
+**Parameters** — add four new parameters:
+- `AvailabilityZone3` — AZ selection (same pattern as `AvailabilityZone2`)
+- `PublicSubnetCIDR3` — public subnet CIDR (default: next available, e.g., `10.0.5.0/24`)
+- `PrivateSubnetCIDR3` — private subnet CIDR (default: next available, e.g., `10.0.6.0/24`)
+- `ExistingPrivateSubnet3` — existing subnet ID for use when `CreateNewVPC=no`
+
+**Metadata** — add the new parameters to `AWS::CloudFormation::Interface` → `ParameterGroups` under "VPC Configuration"
+
+**Conditions** — add `UseSpecificAZ3` (same pattern as `UseSpecificAZ2`)
+
+**VPC Resources** (conditional on `CreateVPC`) — add eight resources following the AZ2 pattern:
+- `PublicSubnet3` — uses `!Select [2, !GetAZs '']` for auto-select
+- `PrivateSubnet3` — same AZ as PublicSubnet3
+- `NATGatewayEIP3` — Elastic IP for the NAT Gateway
+- `NATGateway3` — in PublicSubnet3
+- `PublicSubnetRouteTableAssociation3` — associates PublicSubnet3 with the shared public route table
+- `PrivateRouteTable3` — dedicated route table for the private subnet
+- `PrivateRoute3` — default route through NATGateway3
+- `PrivateSubnetRouteTableAssociation3` — associates PrivateSubnet3 with PrivateRouteTable3
+
+**Outputs** — add VPC outputs for the new AZ:
+- `PublicSubnetId3`, `PrivateSubnetId3`, `NATGatewayId3` (all conditional on `CreateVPC`)
+
+#### Reference
+
+A validated 3-AZ variant of the template is available at [`examples/netskope-ref-architecture-npa-3az.yaml`](../examples/netskope-ref-architecture-npa-3az.yaml) and can be used as a worked example.
 
 ---
 
@@ -748,112 +795,11 @@ Policies:
 
 ---
 
-## Troubleshooting Guide
+## Troubleshooting
 
-### CloudWatch Logs Analysis
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the full troubleshooting guide, including diagnostic commands, log analysis, SSM debugging, and manual testing procedures.
 
-**Lambda Logs Location:**
-```
-/aws/lambda/<PublisherGroupName>-RegistrationHandler
-```
-
-**Key log messages (successful flow):**
-```
-[INFO] Creating a new publisher: MyPublisher-123456789-i-abc123
-[INFO] Successfully obtained registration token: tok_xxxxx
-[INFO] Waiting for instance to be running...
-[INFO] Instance is running, proceeding to SSM check
-[INFO] Checking if instance is available in SSM (attempt 1/10)
-[INFO] Checking if instance is available in SSM (attempt 2/10)
-[INFO] Instance is online in SSM!
-[INFO] Sending registration command to instance
-[INFO] Waiting for command completion...
-[INFO] Command completed successfully
-[INFO] Updating 3 private applications
-[INFO] Publisher registration completed. Updated 3 private applications
-```
-
-**Error indicators:**
-```
-[ERROR] Failed to get registration token: 401 Unauthorized
-[ERROR] Instance did not become running within 120 seconds
-[ERROR] Instance did not become available in Systems Manager within 240 seconds
-[ERROR] Command failed with status: Failed
-[ERROR] StandardErrorContent: /home/ubuntu/npa_publisher_wizard: not found
-```
-
-### SSM Command Debugging
-
-**List recent commands:**
-```bash
-aws ssm list-commands \
-  --instance-id i-0123456789abcdef \
-  --max-results 10
-```
-
-**Get command details:**
-```bash
-aws ssm get-command-invocation \
-  --command-id abc-123-def-456 \
-  --instance-id i-0123456789abcdef \
-  --output json
-```
-
-**View output:**
-```bash
-# See stdout
-aws ssm get-command-invocation \
-  --command-id abc-123-def-456 \
-  --instance-id i-0123456789abcdef \
-  --query 'StandardOutputContent' \
-  --output text
-
-# See stderr
-aws ssm get-command-invocation \
-  --command-id abc-123-def-456 \
-  --instance-id i-0123456789abcdef \
-  --query 'StandardErrorContent' \
-  --output text
-```
-
-### Manual Testing
-
-**Test SSM connectivity:**
-```bash
-# From your workstation
-aws ssm start-session --target i-0123456789abcdef
-
-# Once connected, check SSM agent
-sudo systemctl status amazon-ssm-agent
-sudo journalctl -u amazon-ssm-agent -n 50
-```
-
-**Test Netskope API manually:**
-```bash
-# Get API token
-aws ssm get-parameter \
-  --name /netskope/api-token/MyPublisher \
-  --with-decryption \
-  --query Parameter.Value \
-  --output text
-
-# Test API call
-curl -H "Netskope-Api-Token: $TOKEN" \
-     https://mytenant.goskope.com/api/v2/infrastructure/publishers
-```
-
-**Manually run registration wizard:**
-```bash
-# Connect via Session Manager
-aws ssm start-session --target i-0123456789abcdef
-
-# Run wizard (replace token)
-sudo /home/ubuntu/npa_publisher_wizard -token "your-registration-token"
-
-# Check publisher status
-systemctl status npa_publisher
-```
-
+---
 
 ## References
 

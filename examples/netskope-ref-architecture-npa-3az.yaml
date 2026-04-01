@@ -1,6 +1,6 @@
 ---
 AWSTemplateFormatVersion: 2010-09-09
-Description: "NPA Publisher Dual Instance Multi-AZ (No Auto Scaling) 2.0 - Deploys two NPA Publishers across two availability zones for redundancy"
+Description: "NPA Publisher Triple Instance Multi-AZ (No Auto Scaling) 2.0 - Deploys three NPA Publishers across three availability zones for redundancy"
 
 Metadata:
   cfn-lint:
@@ -36,6 +36,10 @@ Metadata:
           - ExistingVPC
           - ExistingPrivateSubnet
           - ExistingPrivateSubnet2
+          - PublicSubnetCIDR3
+          - PrivateSubnetCIDR3
+          - AvailabilityZone3
+          - ExistingPrivateSubnet3
       -
         Label:
           default: "Netskope NPA Publisher info"
@@ -65,7 +69,7 @@ Metadata:
       ProvisionNewAPIToken:
         default: Choose if you'd like to create a new SSM parameter for Netskope API token or use an existing one
       ExistingNetskopeAPITokenParam:
-        default: Existing SSM parameter name with leading slash (e.g., /netskope/api-token)
+        default: If you're using an existing SSM parameter for the Netskope API token, enter the parameter name here
       NetskopeAPIToken:
         default: Netskope API v2 token if you're creating a new SSM parameter
       VPC:
@@ -180,6 +184,28 @@ Parameters:
     Type: String
     Default: ''
 
+  AvailabilityZone3:
+    Description: 'Third Availability Zone for subnets (only used if CreateNewVPC=yes, leave empty for auto-select)'
+    Type: String
+    Default: ''
+
+  PublicSubnetCIDR3:
+    Description: 'CIDR block for third public subnet (only used if CreateNewVPC=yes)'
+    Type: String
+    Default: '10.0.5.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PrivateSubnetCIDR3:
+    Description: 'CIDR block for third private subnet (only used if CreateNewVPC=yes)'
+    Type: String
+    Default: '10.0.6.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  ExistingPrivateSubnet3:
+    Description: 'Existing private subnet with NAT Gateway in third AZ (only used if CreateNewVPC=no)'
+    Type: String
+    Default: ''
+
   NPAPublisherInstanceType:
     Description: 'EC2 instance type for NPA publisher'
     Type: String
@@ -214,7 +240,7 @@ Parameters:
     Type: String
 
   ExistingNetskopeAPITokenParam:
-    Description: 'If using an existing SSM parameter, enter the full parameter name with leading slash (e.g., /netskope/api-token). For production, use a SecureString parameter created via CLI.'
+    Description: 'If using an existing SSM parameter, enter the parameter name here (e.g., /netskope/api-token). For production, use a SecureString parameter created via CLI.'
     Type: 'String'
     Default: ''
 
@@ -281,6 +307,10 @@ Conditions:
   UseSpecificAZ2: !Not
     - !Equals
       - !Ref AvailabilityZone2
+      - ''
+  UseSpecificAZ3: !Not
+    - !Equals
+      - !Ref AvailabilityZone3
       - ''
   EnableCloudWatchMonitoring: !Equals
     - !Ref EnableCWMonitoring
@@ -424,6 +454,58 @@ Resources:
     Properties:
       ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
       InstanceId: !Ref NPAPublisherInstance2
+      PublisherNamePrefix: !Ref NPAPublisherGroupName
+      AppAssociations: !Ref AppAssociations
+      AccountId: !Ref AWS::AccountId
+      CloudWatchConfigParam:
+        !If
+          - EnableCloudWatchMonitoring
+          - !Sub '/cloudwatch-config/${AWS::StackName}/${NPAPublisherGroupName}'
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------
+  # Publisher 3 — AZ3 (PrivateSubnet3 / ExistingPrivateSubnet3)
+  # ---------------------------------------------------------------
+  NPAPublisherInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref NPAPublisherAMIId
+      InstanceType: !Ref NPAPublisherInstanceType
+      KeyName: !Ref NPAPublisherKey
+      IamInstanceProfile: !Ref NPAPublisherInstanceProfile
+      SecurityGroupIds:
+        - !Ref NPAPublisherSecurityGroup
+      SubnetId:
+        Fn::If:
+          - CreateVPC
+          - !Ref PrivateSubnet3
+          - !Ref ExistingPrivateSubnet3
+      Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData: !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: aws-apn-id
+          Value: 2477fb49-b2ca-409e-9b2b-87322e6008c2
+
+  NPAPublisherRegistration3:
+    Type: Custom::NPAPublisher
+    DependsOn:
+      - NPAPublisherInstance3
+      - NPAPublisherRegistration2
+    Properties:
+      ServiceToken: !GetAtt NPAPublisherRegistrationFunction.Arn
+      InstanceId: !Ref NPAPublisherInstance3
       PublisherNamePrefix: !Ref NPAPublisherGroupName
       AppAssociations: !Ref AppAssociations
       AccountId: !Ref AWS::AccountId
@@ -730,6 +812,121 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable2
 
   # ==============================================================
+  # Third AZ Resources (for three-instance deployment)
+  # ==============================================================
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCIDR3
+      AvailabilityZone:
+        Fn::If:
+          - UseSpecificAZ3
+          - !Ref AvailabilityZone3
+          - !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-PublicSubnet3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCIDR3
+      AvailabilityZone:
+        Fn::If:
+          - UseSpecificAZ3
+          - !Ref AvailabilityZone3
+          - !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-PrivateSubnet3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  NATGatewayEIP3:
+    Type: AWS::EC2::EIP
+    Condition: CreateVPC
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-NAT-EIP3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  NATGateway3:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateVPC
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP3.AllocationId
+      SubnetId: !Ref PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-NAT3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  PublicSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable3:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${NPAPublisherGroupName}-PrivateRT3'
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  PrivateRoute3:
+    Type: AWS::EC2::Route
+    Condition: CreateVPC
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway3
+
+  PrivateSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      SubnetId: !Ref PrivateSubnet3
+      RouteTableId: !Ref PrivateRouteTable3
+
+  # ==============================================================
   # SSM Parameter Store (API Token)
   # ==============================================================
   # NOTE: CloudFormation does not support creating SecureString parameters.
@@ -905,19 +1102,6 @@ Resources:
                     - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${APISecret}'
                     # parameter${name} produces parameter/name when name starts with /
                     - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ExistingNetskopeAPITokenParam}'
-              - !If
-                - ToProvisionNewAPIToken
-                - !Ref AWS::NoValue
-                - Sid: KMSDecryptForSecureString
-                  Effect: Allow
-                  Action:
-                    - 'kms:Decrypt'
-                  Resource:
-                    - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm'
-                    - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
-                  Condition:
-                    StringEquals:
-                      'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'
               - Sid: SSMSendCommandToPublisherInstances
                 Effect: Allow
                 Action:
@@ -1308,3 +1492,37 @@ Outputs:
     Value: !GetAtt NPAPublisherInstance2.PrivateIp
     Export:
       Name: !Sub '${AWS::StackName}-PrivateIP2'
+
+  # Publisher 3
+  PublisherInstanceId3:
+    Description: EC2 Instance ID of NPA Publisher 3
+    Value: !Ref NPAPublisherInstance3
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId3'
+
+  PublisherPrivateIP3:
+    Description: Private IP address of NPA Publisher 3
+    Value: !GetAtt NPAPublisherInstance3.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP3'
+
+  PublicSubnetId3:
+    Condition: CreateVPC
+    Description: Third Public Subnet ID (created by this stack)
+    Value: !Ref PublicSubnet3
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet3'
+
+  PrivateSubnetId3:
+    Condition: CreateVPC
+    Description: Third Private Subnet ID (created by this stack)
+    Value: !Ref PrivateSubnet3
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet3'
+
+  NATGatewayId3:
+    Condition: CreateVPC
+    Description: Third NAT Gateway ID (created by this stack)
+    Value: !Ref NATGateway3
+    Export:
+      Name: !Sub '${AWS::StackName}-NATGateway3'

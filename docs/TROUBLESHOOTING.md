@@ -28,6 +28,31 @@ Common issues and solutions for NPA Publisher deployments on AWS.
 aws logs tail /aws/lambda/<PublisherGroupName>-RegistrationHandler --follow
 ```
 
+**Key log messages (successful flow):**
+```
+[INFO] Creating a new publisher: MyPublisher-123456789-i-abc123
+[INFO] Successfully obtained registration token: tok_xxxxx
+[INFO] Waiting for instance to be running...
+[INFO] Instance is running, proceeding to SSM check
+[INFO] Checking if instance is available in SSM (attempt 1/10)
+[INFO] Checking if instance is available in SSM (attempt 2/10)
+[INFO] Instance is online in SSM!
+[INFO] Sending registration command to instance
+[INFO] Waiting for command completion...
+[INFO] Command completed successfully
+[INFO] Updating 3 private applications
+[INFO] Publisher registration completed. Updated 3 private applications
+```
+
+**Error indicators:**
+```
+[ERROR] Failed to get registration token: 401 Unauthorized
+[ERROR] Instance did not become running within 120 seconds
+[ERROR] Instance did not become available in Systems Manager within 240 seconds
+[ERROR] Command failed with status: Failed
+[ERROR] StandardErrorContent: /home/ubuntu/npa_publisher_wizard: not found
+```
+
 ### Issue: Stack Rollback with "ROLLBACK_IN_PROGRESS"
 
 **Cause**: Resource creation failed during deployment

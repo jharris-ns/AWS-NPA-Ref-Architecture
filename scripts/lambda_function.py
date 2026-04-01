@@ -191,8 +191,10 @@ def lambda_handler(event, context):
 
         if request_type == "Create":
             logger.info("Processing CloudFormation CREATE event")
+            cw_config_param = resource_properties.get("CloudWatchConfigParam")
             result = handle_create(
-                publisher_name, app_associations, ec2_instance_id, token, context
+                publisher_name, app_associations, ec2_instance_id, token, context,
+                cw_config_param=cw_config_param,
             )
             cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
             return
@@ -230,22 +232,127 @@ def lambda_handler(event, context):
 
 
 # ==============================================================
+# APP ASSOCIATION RESOLVER
+# ==============================================================
+
+
+def resolve_target_apps(app_associations, private_apps):
+    """
+    Resolve which private apps to target based on AppAssociations parameter.
+
+    Modes:
+        "All"                    - all private apps
+        "tag:name1,name2"        - apps with ANY matching tag (OR, case-insensitive)
+        "app1,app2"              - apps matching by name (with bracket normalization)
+
+    Returns list of app dicts to associate with the publisher.
+    """
+    association_value = app_associations.strip()
+    association_lower = association_value.lower()
+
+    # Mode: ALL — return every private app
+    if association_lower == "all":
+        logger.info(f"Matching all {len(private_apps)} private apps")
+        return list(private_apps)
+
+    # Mode: TAG — match apps by tag name (OR logic, case-insensitive)
+    if association_lower.startswith("tag:"):
+        target_tag_names = {
+            name.strip().lower()
+            for name in association_value[4:].split(",")
+            if name.strip()
+        }
+
+        if not target_tag_names:
+            logger.warning(
+                "tag: prefix used but no tag names specified - skipping"
+            )
+            return []
+
+        def get_app_tag_names(app):
+            """Extract lowercase tag names from a private app."""
+            return {
+                (tag.get("tag_name") or "").strip().lower()
+                for tag in app.get("tags", [])
+                if isinstance(tag, dict) and tag.get("tag_name")
+            }
+
+        target_apps = [
+            app
+            for app in private_apps
+            if target_tag_names.intersection(get_app_tag_names(app))
+        ]
+
+        # Warn about any requested tag names not found on matched apps
+        found_tags = set()
+        for app in target_apps:
+            found_tags.update(get_app_tag_names(app))
+        missing = sorted(t for t in target_tag_names if t not in found_tags)
+        if missing:
+            logger.warning(
+                f'Tags not found on any private app: {", ".join(missing)}'
+            )
+
+        logger.info(
+            f"Tag matching (OR, case-insensitive) for "
+            f"[{', '.join(sorted(target_tag_names))}]: "
+            f"matched {len(target_apps)} of {len(private_apps)} private apps"
+        )
+        return target_apps
+
+    # Mode: NAME — comma-separated list of app names
+    target_app_names = [
+        name.strip() for name in association_value.split(",") if name.strip()
+    ]
+
+    def app_name_matches(api_name, target_name):
+        """Check if app name matches, ignoring optional brackets."""
+        if api_name == target_name:
+            return True
+        stripped = api_name.strip("[]")
+        return stripped == target_name or stripped == target_name.strip("[]")
+
+    target_apps = [
+        app
+        for app in private_apps
+        if any(
+            app_name_matches(app.get("app_name", ""), name)
+            for name in target_app_names
+        )
+    ]
+
+    # Warn about any app names that weren't found
+    found_names = {app.get("app_name", "").strip("[]") for app in target_apps}
+    missing = [
+        name
+        for name in target_app_names
+        if name.strip("[]") not in found_names
+    ]
+    if missing:
+        logger.warning(f'Private apps not found: {", ".join(missing)}')
+
+    return target_apps
+
+
+# ==============================================================
 # CREATE HANDLER
 # ==============================================================
 
 
 def handle_create(
-    publisher_name, app_associations, ec2_instance_id, token, context=None
+    publisher_name, app_associations, ec2_instance_id, token, context=None,
+    cw_config_param=None,
 ):
     """
     Handle CloudFormation CREATE event - register publisher with Netskope
 
     Args:
         publisher_name: Generated publisher name
-        app_associations: App association mode - 'None', 'All', or comma-separated app names
+        app_associations: App association mode - 'None', 'All', 'tag:name1,name2', or comma-separated app names
         ec2_instance_id: EC2 instance ID
         token: Netskope API token
         context: Lambda context for timeout awareness
+        cw_config_param: SSM parameter name for CloudWatch agent config (None to skip)
 
     Steps:
     1. Create publisher and request registration token from Netskope API
@@ -253,6 +360,7 @@ def handle_create(
     3. Wait for host to become visible in Systems Manager
     4. Run npa_publisher_wizard command via SSM
     5. Update private applications
+    6. Install and configure CloudWatch agent (if enabled)
     """
 
     # ==============================================================
@@ -464,7 +572,6 @@ def handle_create(
     check_timeout_budget(context, required_seconds=60)
     apps_updated = 0
 
-    # AppAssociations: 'None' = skip, 'All' = all apps, or comma-separated list of app names
     if app_associations.strip().lower() == "none":
         logger.info('AppAssociations is "None" - skipping private app updates')
     else:
@@ -487,44 +594,7 @@ def handle_create(
             )
 
         private_apps = resp.get("data", {}).get("private_apps", [])
-
-        # Build target app list
-        if app_associations.strip().lower() == "all":
-            target_apps = private_apps
-        else:
-            # Comma-separated list of app names
-            target_app_names = [
-                name.strip() for name in app_associations.split(",") if name.strip()
-            ]
-
-            # Match app names with or without square brackets
-            # Netskope API may return names like "[App Name]" while users
-            # provide "App Name" — match either form
-            def app_name_matches(api_name, target_name):
-                """Check if app name matches, ignoring optional brackets."""
-                if api_name == target_name:
-                    return True
-                stripped = api_name.strip("[]")
-                return stripped == target_name or stripped == target_name.strip("[]")
-
-            target_apps = [
-                app
-                for app in private_apps
-                if any(
-                    app_name_matches(app.get("app_name", ""), name)
-                    for name in target_app_names
-                )
-            ]
-
-            # Warn about any app names that weren't found
-            found_names = {app.get("app_name", "").strip("[]") for app in target_apps}
-            missing = [
-                name
-                for name in target_app_names
-                if name.strip("[]") not in found_names
-            ]
-            if missing:
-                logger.warning(f'Private apps not found: {", ".join(missing)}')
+        target_apps = resolve_target_apps(app_associations, private_apps)
 
         for app in target_apps:
             private_app_id = app.get("app_id")
@@ -573,11 +643,90 @@ def handle_create(
             f"Publisher registration completed. Updated {apps_updated} private applications"
         )
 
+    # ==============================================================
+    # STEP 6: Install and Configure CloudWatch Agent (if enabled)
+    # ==============================================================
+
+    cw_installed = False
+    if cw_config_param:
+        check_timeout_budget(context, required_seconds=120)
+        logger.info("Installing CloudWatch agent via SSM Distributor...")
+
+        try:
+            install_success = False
+            for install_attempt in range(3):
+                if install_attempt > 0:
+                    logger.info(
+                        f"Retrying CW agent install (attempt {install_attempt + 1}/3)..."
+                    )
+                    time.sleep(5)
+
+                response = ssm_client.send_command(
+                    InstanceIds=[ec2_instance_id],
+                    DocumentName="AWS-ConfigureAWSPackage",
+                    Comment="Install CloudWatch agent",
+                    Parameters={
+                        "action": ["Install"],
+                        "name": ["AmazonCloudWatchAgent"],
+                    },
+                    TimeoutSeconds=120,
+                )
+                install_cmd_id = response["Command"]["CommandId"]
+                logger.info(
+                    f"CW agent install command sent. Command ID: {install_cmd_id}"
+                )
+
+                install_success = wait_for_command_completion(
+                    ssm_client, install_cmd_id, ec2_instance_id, context, max_wait=120
+                )
+
+                if install_success:
+                    break
+
+            if not install_success:
+                logger.warning(
+                    "CloudWatch agent install failed after 3 attempts - skipping configure"
+                )
+            else:
+                logger.info("CloudWatch agent installed. Configuring...")
+
+                response = ssm_client.send_command(
+                    InstanceIds=[ec2_instance_id],
+                    DocumentName="AmazonCloudWatch-ManageAgent",
+                    Comment="Configure CloudWatch agent",
+                    Parameters={
+                        "action": ["configure"],
+                        "mode": ["ec2"],
+                        "optionalConfigurationSource": ["ssm"],
+                        "optionalConfigurationLocation": [cw_config_param],
+                        "optionalRestart": ["yes"],
+                    },
+                    TimeoutSeconds=60,
+                )
+                config_cmd_id = response["Command"]["CommandId"]
+                logger.info(
+                    f"CW agent configure command sent. Command ID: {config_cmd_id}"
+                )
+
+                config_success = wait_for_command_completion(
+                    ssm_client, config_cmd_id, ec2_instance_id, context, max_wait=60
+                )
+
+                if config_success:
+                    logger.info("CloudWatch agent configured and started")
+                    cw_installed = True
+                else:
+                    logger.warning("CloudWatch agent configure failed")
+
+        except Exception as e:
+            logger.warning(f"CloudWatch agent setup failed (non-fatal): {e}")
+
     return {
         "PublisherId": publisher_id,
         "PublisherName": publisher_name,
         "Status": "Registered",
         "AppsUpdated": apps_updated,
+        "CloudWatchAgent": cw_installed,
         "Idempotent": False,
     }
 
