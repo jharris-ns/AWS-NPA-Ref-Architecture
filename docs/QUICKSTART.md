@@ -236,6 +236,7 @@ aws cloudformation describe-stacks \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `NPAPublisherInstanceType` | EC2 instance type | `t3.large` |
+| `AppAssociations` | Private apps to associate with publishers. `None` to skip, `All` for all apps, `tag:name1,name2` for tag-based matching (OR, case-insensitive), or comma-separated app names. See [Private App Associations](#private-app-associations). | `None` |
 | `ProvisionNewAPIToken` | Store API token in SSM Parameter Store | `yes` |
 
 ## Deployment Timeline
@@ -356,18 +357,22 @@ The `AppAssociations` parameter controls which existing private apps the publish
 |-------|-----------|
 | `None` (default) | Skip — no apps are assigned. Assign manually in the Netskope UI after deployment. |
 | `All` | Assign the publisher to **every** existing private app in the tenant. |
+| `tag:name1,name2` | Assign to apps that have **any** of the listed tags (OR logic, case-insensitive). |
 | `App1,App2` | Comma-separated list of exact app names to assign. |
 
 ```
 Examples:
-  AppAssociations = None           → no automatic assignment
-  AppAssociations = All            → assigned to all private apps
-  AppAssociations = SSH,WebPortal  → assigned to "SSH" and "WebPortal" only
+  AppAssociations = None              → no automatic assignment
+  AppAssociations = All               → assigned to all private apps
+  AppAssociations = tag:production    → assigned to apps tagged "production"
+  AppAssociations = tag:web,database  → assigned to apps tagged "web" OR "database"
+  AppAssociations = SSH,WebPortal     → assigned to "SSH" and "WebPortal" only
 ```
 
 **How it works:**
 - During stack creation, the Lambda function queries existing private apps and assigns the publisher to matching apps
-- App names are matched exactly (case-sensitive) against the names shown in the Netskope UI
+- **Tag mode** (`tag:`) matches against the tags assigned to private apps in the Netskope UI. Matching is OR-based (any tag matches) and case-insensitive. Unmatched tag names are logged as warnings.
+- **Name mode** matches app names exactly (case-sensitive) against the names shown in the Netskope UI
 - On stack deletion, the Lambda function automatically removes the publisher from all associated apps
 
 **Note:** If you create new apps after deployment, assign publishers manually in the Netskope UI under **Settings → Security Cloud Platform → App Definition**.
