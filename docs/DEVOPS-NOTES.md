@@ -252,6 +252,7 @@ def wait_for_command_completion(ssm_client_ref, command_id, instance_id, context
 # Uses app_associations parameter to control behavior:
 # - "None": skip app assignment
 # - "All": assign publisher to all private apps
+# - "tag:name1,name2": assign to apps with any matching tag (OR, case-insensitive)
 # - "app1,app2": assign to named apps only
 # Uses call_netskope_api_with_retry for each PATCH
 ```
