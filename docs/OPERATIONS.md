@@ -147,7 +147,19 @@ aws logs tail /aws/lambda/<PublisherGroupName>-RegistrationHandler --follow
 
 ## Update Publisher AMI Version
 
-Updating the AMI triggers CloudFormation to replace both EC2 instances (the old publishers are deregistered and new ones are registered automatically).
+Updating the `NPAPublisherAMIId` parameter triggers CloudFormation to replace the EC2 instances with new ones built from the new AMI. The Lambda Custom Resource UPDATE handler automatically handles re-registration: it registers each new publisher with Netskope, assigns it to the same private apps, and deregisters the old publisher — no manual console cleanup needed.
+
+### How it works
+
+When AMI changes, CloudFormation:
+1. Creates replacement EC2 instances (new instance IDs)
+2. Sends an **UPDATE** event to each `Custom::NPAPublisher` resource with both old and new instance IDs
+3. Lambda detects the ID change and calls the full CREATE flow for the new instance, then best-effort deregisters the old one
+4. Deletes the old EC2 instances during the cleanup phase
+
+The registrations are serialized (via `DependsOn`) to prevent race conditions when multiple publishers write to shared private app definitions. See [DEVOPS-NOTES.md](DEVOPS-NOTES.md#ami-replacement-and-re-registration) for the full technical details.
+
+**Note on instance type changes:** Changing `NPAPublisherInstanceType` does **not** trigger re-registration. CloudFormation performs an in-place stop/start for instance type changes — the instance ID stays the same, so the Lambda UPDATE handler takes no action. Re-registration only occurs when the instance is fully replaced (i.e., when properties like `ImageId`, `SubnetId`, or `KeyName` change).
 
 ### Step 1: Get new AMI ID
 
@@ -180,7 +192,18 @@ aws cloudformation update-stack \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-**Impact**: Both instances are replaced. In a multi-AZ deployment, CloudFormation replaces them one at a time so connectivity is maintained.
+**Impact**: All instances are replaced. Publishers remain available on other AZs while each replacement completes. Total downtime per publisher is typically 3–5 minutes (EC2 boot + SSM + registration wizard).
+
+### Verifying after AMI update
+
+Check CloudWatch Logs for the registration Lambda (`/aws/lambda/<stack>-<group>-RegistrationHandler`) and confirm entries like:
+
+```
+Instance replaced: i-<old> -> i-<new>. Registering new instance...
+Old publisher deregistered: <publisher-name>-<account-id>-i-<old>
+```
+
+If you see `Insufficient Lambda time budget to clean up old publisher`, check the Netskope console for disconnected publishers and remove them manually.
 
 ## Scale Up/Down Instance Type
 

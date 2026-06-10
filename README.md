@@ -151,16 +151,14 @@ CloudFormation Stack
     │
     ├─ EC2 Instance (with SSM Agent)
     │
-    ├─ Custom Resource (triggers on CREATE/DELETE)
+    ├─ Custom Resource (triggers on CREATE/UPDATE/DELETE)
     │      │
     │      └─ Lambda Function
     │             │
-    │             ├─ Reads API token from SSM Parameter Store
-    │             ├─ Calls Netskope API to create publisher & get registration token
-    │             ├─ Waits for instance to be running
-    │             ├─ Waits for SSM Agent to be online
-    │             ├─ Sends SSM command: npa_publisher_wizard -token $REGISTRATION_TOKEN
-    │             └─ Updates private applications
+    │             ├─ CREATE: Reads API token → registers publisher → runs wizard via SSM → assigns apps
+    │             ├─ UPDATE: Detects if instance was replaced (AMI change) → re-registers new instance
+    │             │          and deregisters old publisher; no-op if instance ID unchanged
+    │             └─ DELETE: Removes publisher from apps → waits for disconnect → deletes from Netskope
     │
     └─ Outputs (Instance ID, Private IP, etc.)
 ```
@@ -224,6 +222,19 @@ For more information on configuring network segment discovery, see [Netskope doc
 7. **Lambda waits for command completion** (up to 5 minutes)
 8. **Lambda assigns publisher to private apps** based on the `AppAssociations` parameter (`None`, `All`, or a comma-separated list of app names)
 9. **Custom Resource returns SUCCESS** to CloudFormation
+
+### On AMI Update (UPDATE — instance replaced)
+
+When you change `NPAPublisherAMIId`, CloudFormation replaces the EC2 instance and sends an UPDATE event to the Custom Resource with both the old and new instance IDs.
+
+1. **Lambda detects instance ID change** (`OldResourceProperties.InstanceId` ≠ `ResourceProperties.InstanceId`)
+2. **Lambda registers the new instance** — full CREATE flow (API call, SSM wizard, app assignment)
+3. **Lambda deregisters the old publisher** — removes from apps and deletes from Netskope (best-effort; skipped if Lambda time budget < 90s)
+4. **CloudFormation terminates the old instance** during the cleanup phase
+
+No manual Netskope console cleanup is needed. Registrations are serialized via `DependsOn` to prevent race conditions when multiple publishers update shared app definitions simultaneously.
+
+**Note:** Instance type changes (`NPAPublisherInstanceType`) are performed in-place (stop/start) and do **not** trigger re-registration — the instance ID does not change.
 
 ### On Stack Deletion (DELETE)
 
@@ -307,6 +318,15 @@ The Lambda function (`scripts/lambda_function.py`) handles publisher lifecycle:
 - `call_netskope_api()` - Netskope REST API v2 wrapper
 - `get_secret()` - SSM Parameter Store integration
 
+### UPDATE Handler (AMI Re-Registration)
+
+When a stack update replaces EC2 instances (e.g., AMI change), the Lambda UPDATE handler:
+1. Compares `OldResourceProperties.InstanceId` with `ResourceProperties.InstanceId`
+2. If different: runs the full CREATE flow for the new instance, then best-effort deregisters the old publisher
+3. If same: returns SUCCESS immediately with no action (handles tag changes, parameter updates, etc.)
+
+A 90-second time budget guard prevents the old publisher cleanup from causing a Lambda timeout. If cleanup is skipped, a warning is written to CloudWatch Logs.
+
 ### Automatic Application Management
 
 The Lambda function automatically manages private application assignments:
@@ -352,8 +372,9 @@ Approximate monthly costs for us-east-1 region:
 - ✅ **No secrets in user data** - Token passed via SSM only
 - ✅ **No public IPs** - Instance in private subnet
 - ⚠️ **Egress rules** - Currently allows all HTTPS (0.0.0.0/0) as temporary workaround (see [Netskope IP Ranges](#netskope-ip-ranges))
+- ✅ **Port 80 egress** - Permitted to `0.0.0.0/0` for publisher auto-updates (`*.ubuntu.com`), per Netskope documentation
 - ✅ **VPC endpoints for Systems Manager** - Private connectivity without internet routing
-- ✅ **IAM least privilege** - Minimal permissions
+- ✅ **IAM least privilege** - Minimal permissions; use `AdditionalPolicyArn1/2/3` parameters to attach extra managed policies if needed
 - ✅ **SSM Parameter Store** - Secure token storage (supports SecureString encryption)
 - ✅ **SSM Session Manager** - No SSH keys needed
 - ✅ **No inbound rules** - Publishers only initiate outbound connections

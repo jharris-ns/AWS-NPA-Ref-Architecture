@@ -10,6 +10,7 @@ This document explains the technical implementation details of the NPA Publisher
 - [Lambda Function Architecture](#lambda-function-architecture)
   - [Scaling to Additional Availability Zones](#scaling-to-additional-availability-zones)
   - [Private App Publisher Assignment](#private-app-publisher-assignment)
+- [AMI Replacement and Re-Registration](#ami-replacement-and-re-registration)
 - [Integration Flow](#integration-flow)
 - [Error Handling & Retries](#error-handling--retries)
 - [Timer & Polling Architecture](#timer--polling-architecture)
@@ -185,9 +186,10 @@ def lambda_handler(event, context):
     elif request_type == 'Delete':
         return handle_delete(event, context)
     elif request_type == 'Update':
-        # Updates handled as no-op
-        return send_response(event, context, 'SUCCESS')
+        return handle_update(event, context)
 ```
+
+The UPDATE path compares the old and new instance IDs. If they differ (instance was replaced), it re-registers the new publisher and best-effort deregisters the old one. If they are the same (e.g., a tag or parameter change that did not replace the instance), it acknowledges with no action. See [AMI Replacement and Re-Registration](#ami-replacement-and-re-registration) for full details.
 
 #### 3. CREATE Flow (handle_create)
 
@@ -305,6 +307,84 @@ Uses `remove_publisher_from_apps()` — see [Private App Publisher Assignment](#
 ```
 
 See [OPERATIONS.md](OPERATIONS.md#publisher-deletion-workflow) for the operator-facing view of this workflow.
+
+---
+
+## AMI Replacement and Re-Registration
+
+### When It Triggers
+
+Changing the `NPAPublisherAMIId` CloudFormation parameter forces a **resource replacement** on each `AWS::EC2::Instance`. CloudFormation creates a new EC2 instance (new instance ID), then sends a Custom Resource **UPDATE** event to each `Custom::NPAPublisher` resource with both the old and new instance IDs in the event payload.
+
+**Important:** Not all stack updates trigger re-registration. CloudFormation only sends an UPDATE event with a different instance ID when the instance is actually replaced. Properties that cause replacement include `ImageId` (AMI), `SubnetId`, and `KeyName`. Instance type changes are performed **in-place** (stop/start without a new instance ID) and do **not** trigger re-registration.
+
+### UPDATE Event Payload
+
+CloudFormation passes both old and new resource properties in the UPDATE event:
+
+```json
+{
+  "RequestType": "Update",
+  "ResourceProperties": {
+    "InstanceId": "i-0b6ba13f8eff5b801",   ← new instance
+    "PublisherNamePrefix": "my-publisher",
+    ...
+  },
+  "OldResourceProperties": {
+    "InstanceId": "i-073843bf16fab2989",    ← old instance
+    "PublisherNamePrefix": "my-publisher",
+    ...
+  }
+}
+```
+
+### UPDATE Handler Logic
+
+```python
+if request_type == "Update":
+    old_instance_id = event.get("OldResourceProperties", {}).get("InstanceId")
+
+    if old_instance_id and old_instance_id != ec2_instance_id:
+        # Instance was replaced — register new, deregister old (best-effort)
+        result = handle_create(publisher_name, ..., ec2_instance_id, ...)
+
+        # Only attempt cleanup if > 90s of Lambda budget remains
+        remaining_ms = get_remaining_time_ms(context)
+        if remaining_ms is None or remaining_ms > 90000:
+            handle_delete(old_publisher_name, ..., instance_id=old_instance_id)
+        else:
+            logger.warning("Insufficient Lambda time budget to clean up old publisher")
+    else:
+        # Instance unchanged — acknowledge with no action
+        cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                         {"Message": "Update acknowledged - no instance change"})
+```
+
+### Registration Serialization on AMI Updates
+
+The `DependsOn` chain between Registration resources applies equally to UPDATE events. CloudFormation processes Custom Resource updates in dependency order:
+
+```
+UPDATE NPAPublisherRegistration   (Publisher 1 re-registers)
+    → UPDATE NPAPublisherRegistration2  (Publisher 2 re-registers)
+        → UPDATE NPAPublisherRegistration3  (Publisher 3 re-registers, if 3AZ template)
+```
+
+This prevents the same race condition described in [The Race Condition](#the-race-condition) — concurrent re-registrations attempting to assign the new publisher to the same private apps would overwrite each other.
+
+### Old Publisher Cleanup
+
+After re-registering the new instance, the Lambda best-effort deregisters the old publisher by name:
+
+1. The old publisher name is derived from the publisher name prefix and the old instance ID: `{prefix}-{account_id}-{old_instance_id}`
+2. `handle_delete` removes the old publisher from all app assignments and deletes it from Netskope
+3. If the Lambda is running low on time budget (< 90s remaining), cleanup is skipped with a warning in CloudWatch Logs — the old publisher will disconnect naturally when CloudFormation terminates the old EC2 instance during the cleanup phase
+
+**Manual cleanup** may be needed only if the Lambda time budget was exhausted. Check for disconnected publishers in **Settings → Security Cloud Platform → Publishers** after an AMI update completes.
+
+### CloudFormation Cleanup Phase
+
+After all Custom Resources complete their UPDATE, CloudFormation enters `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS` and sends DELETE events to the old Custom Resource physical IDs. These DELETE events are harmless — the old publisher has already been deregistered by the UPDATE handler.
 
 ---
 
@@ -710,6 +790,15 @@ Lambda Timeout (600s)
 │   ├── SSM readiness polling         (SSM_READY_TIMEOUT=240s, 30s buffer)
 │   ├── wait_for_command_completion   (COMMAND_TIMEOUT=300s, 30s buffer)
 │   └── cfnresponse.send()
+│
+├── UPDATE path (instance replaced — e.g. AMI change)
+│   ├── handle_create() for new instance  (same budget as CREATE path above)
+│   ├── check remaining_ms > 90000        ← 90s guard before attempting old cleanup
+│   ├── handle_delete() for old publisher (best-effort, skipped if < 90s remains)
+│   └── cfnresponse.send()
+│
+│   UPDATE path (instance unchanged — e.g. tag/parameter change)
+│   └── cfnresponse.send(SUCCESS, "Update acknowledged - no instance change")
 │
 └── DELETE path
     ├── check_timeout_budget(120s) ← pre-flight check
