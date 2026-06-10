@@ -200,13 +200,66 @@ def lambda_handler(event, context):
             return
 
         if request_type == "Update":
-            logger.info("Processing CloudFormation UPDATE event - no action needed")
-            cfnresponse.send(
-                event,
-                context,
-                cfnresponse.SUCCESS,
-                {"Message": "Update completed (no changes required)"},
-            )
+            old_props = event.get("OldResourceProperties", {})
+            old_instance_id = old_props.get("InstanceId")
+
+            if old_instance_id and old_instance_id != ec2_instance_id:
+                # Instance was replaced (e.g. AMI change) — register the new instance
+                # then best-effort deregister the old one. CloudFormation terminates the
+                # old instance after this handler returns, so we stop it first to trigger
+                # a clean Netskope disconnect before attempting deletion.
+                logger.info(
+                    f"Instance replaced: {old_instance_id} -> {ec2_instance_id}. "
+                    "Registering new instance..."
+                )
+                cw_config_param = resource_properties.get("CloudWatchConfigParam")
+                result = handle_create(
+                    publisher_name, app_associations, ec2_instance_id, token, context,
+                    cw_config_param=cw_config_param,
+                )
+
+                old_publisher_name = (
+                    f"{publisher_name_prefix}-{account_id}-{old_instance_id}"
+                )
+                remaining_ms = get_remaining_time_ms(context)
+                if remaining_ms is None or remaining_ms > 90000:
+                    try:
+                        logger.info(
+                            f"Cleaning up replaced publisher: {old_publisher_name}"
+                        )
+                        handle_delete(
+                            old_publisher_name, token, context,
+                            instance_id=old_instance_id,
+                        )
+                        logger.info(
+                            f"Old publisher deregistered: {old_publisher_name}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not fully clean up old publisher "
+                            f"{old_publisher_name}: {e}. "
+                            "The publisher will disconnect when CloudFormation "
+                            "terminates the old instance. Manual cleanup may be "
+                            "required in the Netskope console."
+                        )
+                else:
+                    logger.warning(
+                        f"Insufficient Lambda time budget to clean up old publisher "
+                        f"{old_publisher_name}. Manual cleanup may be required in "
+                        "the Netskope console."
+                    )
+
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+            else:
+                logger.info(
+                    "UPDATE event - instance unchanged, no re-registration needed"
+                )
+                cfnresponse.send(
+                    event,
+                    context,
+                    cfnresponse.SUCCESS,
+                    {"Message": "Update acknowledged - no instance change"},
+                )
             return
 
         logger.error(f"Unknown request type: {request_type}")
