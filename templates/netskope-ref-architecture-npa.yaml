@@ -46,6 +46,9 @@ Metadata:
           - NPAPublisherKey
           - NPAPublisherInstanceType
           - EnableCWMonitoring
+          - AdditionalPolicyArn1
+          - AdditionalPolicyArn2
+          - AdditionalPolicyArn3
       -
         Label:
           default: "Lambda deployment configuration"
@@ -260,6 +263,24 @@ Parameters:
     Type: String
     Default: 'npa-publisher-lambda.zip'
 
+  # NOTE: CloudFormation has no list-merge intrinsic function, so additional managed policies
+  # are handled as individual optional parameters (a CloudFormation convention, not a best
+  # practice — CDK/Terraform handle this more elegantly). Supports up to 3 extra policies.
+  AdditionalPolicyArn1:
+    Description: '(Optional) Additional IAM managed policy ARN to attach to the publisher instance role (e.g., for custom SSM documents or S3 access)'
+    Type: String
+    Default: ''
+
+  AdditionalPolicyArn2:
+    Description: '(Optional) Second additional IAM managed policy ARN to attach to the publisher instance role'
+    Type: String
+    Default: ''
+
+  AdditionalPolicyArn3:
+    Description: '(Optional) Third additional IAM managed policy ARN to attach to the publisher instance role'
+    Type: String
+    Default: ''
+
 Conditions:
   ToProvisionNewAPIToken: !Equals
     - !Ref ProvisionNewAPIToken
@@ -285,6 +306,9 @@ Conditions:
   EnableCloudWatchMonitoring: !Equals
     - !Ref EnableCWMonitoring
     - 'yes'
+  HasAdditionalPolicy1: !Not [!Equals [!Ref AdditionalPolicyArn1, '']]
+  HasAdditionalPolicy2: !Not [!Equals [!Ref AdditionalPolicyArn2, '']]
+  HasAdditionalPolicy3: !Not [!Equals [!Ref AdditionalPolicyArn3, '']]
 
 Mappings:
   SourceCode:
@@ -839,6 +863,9 @@ Resources:
           - EnableCloudWatchMonitoring
           - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
           - !Ref AWS::NoValue
+        - !If [HasAdditionalPolicy1, !Ref AdditionalPolicyArn1, !Ref AWS::NoValue]
+        - !If [HasAdditionalPolicy2, !Ref AdditionalPolicyArn2, !Ref AWS::NoValue]
+        - !If [HasAdditionalPolicy3, !Ref AdditionalPolicyArn3, !Ref AWS::NoValue]
       Policies:
         - !If
           - EnableCloudWatchMonitoring
@@ -1124,6 +1151,13 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: "TEMPORARY: Allow all HTTPS - pending complete Netskope IP ranges"
+        # Publisher auto-updates: *.ubuntu.com requires TCP/80
+        # Source: Netskope docs - "Publisher Outbound Connectivity Requirements"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "Publisher auto-updates: *.ubuntu.com (TCP/80) per Netskope docs"
       Tags:
         - Key: Name
           Value: !Sub '${NPAPublisherGroupName}-SecurityGroup'
