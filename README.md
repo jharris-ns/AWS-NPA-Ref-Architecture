@@ -18,6 +18,7 @@ This project includes comprehensive documentation for deployment, operations, an
 - **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures for managing running deployments (replace publishers, update AMIs, scale instances, rotate tokens, monitoring)
 - **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions with diagnostic commands
 - **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive into SSM integration, Lambda internals, and architecture decisions
+- **[TRANSIT-GATEWAY-INTEGRATION.md](docs/TRANSIT-GATEWAY-INTEGRATION.md)** - Post-deployment guide for connecting the NPA VPC to an AWS Transit Gateway
 
 **Quick Links:**
 - Want to understand the architecture? See **[ARCHITECTURE.md](docs/ARCHITECTURE.md)**
@@ -25,6 +26,7 @@ This project includes comprehensive documentation for deployment, operations, an
 - Need to deploy? See **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)**
 - Already deployed? Check **[OPERATIONS.md](docs/OPERATIONS.md)**
 - Having issues? See **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**
+- Connecting to other VPCs? See **[TRANSIT-GATEWAY-INTEGRATION.md](docs/TRANSIT-GATEWAY-INTEGRATION.md)**
 
 ## IAM Permissions Required
 
@@ -291,6 +293,7 @@ AWS-NPA-Ref-Architecture/
 │   ├── TROUBLESHOOTING.md                 # Common issues and solutions
 │   ├── DEVOPS-NOTES.md                    # Technical deep-dive (SSM, Lambda internals)
 │   ├── IAM-ROLE-SETUP.md                  # Guide for creating and assuming IAM roles for deployment
+│   ├── TRANSIT-GATEWAY-INTEGRATION.md     # Post-deployment TGW connectivity guide
 │   └── images/
 │       └── npa_reference_architecture.png # Architecture diagram
 ├── scripts/
@@ -426,6 +429,7 @@ App names are matched exactly (case-sensitive) against the names shown in the Ne
 - **[OPERATIONS.md](docs/OPERATIONS.md)** - Operational procedures (replace publishers, AMI updates, monitoring)
 - **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions
 - **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** - Technical deep-dive (SSM, Lambda internals)
+- **[TRANSIT-GATEWAY-INTEGRATION.md](docs/TRANSIT-GATEWAY-INTEGRATION.md)** - Post-deployment guide for TGW connectivity and network segmentation
 
 ### External Resources
 - [Netskope REST API v2](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
